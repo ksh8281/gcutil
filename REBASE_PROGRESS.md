@@ -1128,7 +1128,7 @@ Compile GCUtil under `GC_DEBUG` configuration, and verify that GC_MALLOC_EXPLICI
    `GC_adj_bytes_allocd()` exceeds
    `max(MIN_BYTES_SINCE_GC_BEFORE_COLLECT, GC_heapsize / divisor)`.
    `MIN_BYTES_SINCE_GC_BEFORE_COLLECT` is 10 MB and
-   `DEFAULT_ALLOCHBLK_COLLECT_DIVISOR` is 4; both are `#ifndef`-guarded so a
+   `DEFAULT_ALLOCHBLK_COLLECT_DIVISOR` is 3; both are `#ifndef`-guarded so a
    build can override them. A divisor of zero selects the fixed floor alone.
 
 3. **`GC_allochblk()` (allchblk.c):** replace F1's inline threshold test with a
