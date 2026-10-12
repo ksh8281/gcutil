@@ -1948,6 +1948,16 @@ GC_enable_incremental(void)
    * pointless.
    */
   if (!GC_find_leak_inner && NULL == GETENV("GC_DISABLE_INCREMENTAL")) {
+#  if defined(ENABLE_TLS_ACCESS_BY_ADDRESS) \
+      || defined(ENABLE_TLS_ACCESS_BY_PTHREAD_KEY)
+    /* GC_arrays uses a TLS slot/offset established by GC_init().  Before
+       that, access the actual TLS instance, as GC_init() itself does. */
+    if (!GC_arrays_instance._is_initialized) {
+      GC_arrays_instance._incremental = TRUE;
+      GC_init();
+      return;
+    }
+#  endif
     LOCK();
     if (!GC_incremental) {
 #  if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)

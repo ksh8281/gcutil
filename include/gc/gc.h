@@ -601,6 +601,16 @@ GC_API void GC_CALL GC_set_rate(int);
 GC_API int GC_CALL GC_get_rate(void);
 
 /**
+ * Enable allocation/dirty-page based incremental collection scheduling.
+ * This is opt-in and does not enable incremental mode itself.  The rate,
+ * time limit and retry count remain controlled by their existing setters.
+ * The time limit is also checked while doing incremental marking work;
+ * it remains a soft limit.  Not synchronized.
+ */
+GC_API void GC_CALL GC_set_adaptive_incremental(int);
+GC_API int GC_CALL GC_get_adaptive_incremental(void);
+
+/**
  * Set/get the maximum number of prior attempts at the world-stop marking.
  * Not synchronized.
  */

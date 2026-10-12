@@ -4019,6 +4019,8 @@ GC_INNER void GC_dirty_deinit(void);
  * `output_unneeded` is `TRUE` at least if the multi-threading support is on).
  */
 GC_INNER void GC_read_dirty(GC_bool output_unneeded);
+/* Non-destructive estimate from the current dirty-page hash bitmap. */
+GC_INNER word GC_current_dirty_bytes(word *hot_bytes);
 
 /*
  * Is the `HBLKSIZE`-sized page at `h` marked dirty in the local buffer?

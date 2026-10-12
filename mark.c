@@ -141,6 +141,8 @@ GC_reset_obj_kinds(void)
  * etc.  Used for logging only.
  */
 STATIC MAY_THREAD_LOCAL word GC_n_rescuing_pages = 0;
+STATIC MAY_THREAD_LOCAL word GC_rescuing_span_bytes = 0;
+STATIC MAY_THREAD_LOCAL word GC_rescuing_skipped_bytes = 0;
 #endif
 
 GC_API void GC_CALL
@@ -368,6 +370,8 @@ GC_initiate_gc(void)
 #  endif
   }
   GC_n_rescuing_pages = 0;
+  GC_rescuing_span_bytes = 0;
+  GC_rescuing_skipped_bytes = 0;
 #endif
   if (GC_mark_state == MS_NONE) {
     GC_mark_state = MS_PUSH_RESCUERS;
@@ -461,6 +465,10 @@ GC_mark_some(ptr_t cold_gc_frame)
       if (NULL == GC_scan_ptr) {
         GC_COND_LOG_PRINTF("Marked from %lu dirty pages\n",
                            (unsigned long)GC_n_rescuing_pages);
+        GC_COND_LOG_PRINTF("Dirty rescan candidate span: %lu bytes\n",
+                           (unsigned long)GC_rescuing_span_bytes);
+        GC_COND_LOG_PRINTF("Dirty rescan skipped large-object span: %lu bytes\n",
+                           (unsigned long)GC_rescuing_skipped_bytes);
       }
 #endif
       push_roots_and_advance(FALSE, cold_gc_frame);
@@ -2242,6 +2250,57 @@ GC_push_marked4(struct hblk *h, const hdr *hhdr)
 #  endif
 #endif /* !USE_MARK_BYTES && !MARK_BIT_PER_OBJ && !SMALL_CONFIG */
 
+#ifndef GC_DISABLE_INCREMENTAL
+/* Rescuing a marked length object only needs fields in dirty pages.  Its
+ * clean fields have already been traced.  New objects and invalid mark-stack
+ * recovery still use the complete descriptor through the ordinary paths.
+ */
+STATIC word
+GC_push_marked_dirty_ranges(struct hblk *h, const hdr *hhdr)
+{
+  ptr_t p = h->hb_body;
+  ptr_t end = p + hhdr->hb_descr;
+  mse *top = GC_mark_stack_top;
+  mse *limit = GC_mark_stack_limit;
+  word selected = 0;
+
+  while (ADDR_LT(p, end)) {
+    ptr_t begin, range_end;
+
+    if (!GC_page_was_dirty((const struct hblk *)p)) {
+      p += HBLKSIZE;
+      continue;
+    }
+    begin = p;
+    do {
+      p += HBLKSIZE;
+    } while (ADDR_LT(p, end)
+             && GC_page_was_dirty((const struct hblk *)p));
+    range_end = ADDR_LT(p, end) ? p : end;
+    if (ADDR_GE((ptr_t)top,
+                 (ptr_t)(GC_mark_stack + 3 * GC_mark_stack_size / 4))) {
+      /* Keep one continuation for the remaining object when fragmented
+       * dirty ranges would fill the mark stack.  Including clean pages is
+       * conservative and avoids repeatedly invalidating the mark state.
+       */
+      range_end = end;
+      p = end;
+    }
+    selected += range_end - begin;
+#  if defined(ESCARGOT_USE_32BIT_IN_64BIT)
+    if ((hhdr->hb_flags & COMPRESSED_POINTERS) != 0) {
+      top = GC_push_32bit_range(begin, (size_t)(range_end - begin), top, limit);
+    } else
+#  endif
+    {
+      top = GC_ms_push_obj_descr(begin, (word)(range_end - begin), top, limit);
+    }
+  }
+  GC_mark_stack_top = top;
+  return hhdr->hb_descr - selected;
+}
+#endif
+
 /* Push all objects reachable from marked objects in the given block. */
 STATIC void
 GC_push_marked(struct hblk *h, const hdr *hhdr)
@@ -2261,8 +2320,34 @@ GC_push_marked(struct hblk *h, const hdr *hhdr)
 
 #if !defined(GC_DISABLE_INCREMENTAL)
   GC_n_rescuing_pages++;
+  /* A dirty page can cause a whole large object to be revisited.  This is
+     the candidate span, not an exact count of pointer words scanned. */
+  GC_rescuing_span_bytes += sz > MAXOBJBYTES ? (word)sz : HBLKSIZE;
 #endif
   GC_objects_are_marked = TRUE;
+#ifndef GC_DISABLE_INCREMENTAL
+  if (GC_mark_state == MS_PUSH_RESCUERS
+      && sz > HBLKSIZE && (hhdr->hb_descr & GC_DS_TAGS) == GC_DS_LENGTH
+      && hhdr->hb_descr <= sz && mark_bit_from_hdr(hhdr, 0)
+#  if defined(ESCARGOT_USE_32BIT_IN_64BIT)
+      && (hhdr->hb_flags & COMPRESSED_BITMAP) == 0
+      && ((hhdr->hb_flags & COMPRESSED_POINTERS) != 0
+          || ALIGNMENT == sizeof(ptr_t))
+#  else
+      && ALIGNMENT == sizeof(ptr_t)
+#  endif
+      && GC_get_adaptive_incremental()
+  ) {
+    /* Aligned native/compressed slots cannot straddle a heap-block boundary.
+     * Other formats, including mark procedures, retain whole-object tracing.
+     */
+    word skipped = GC_push_marked_dirty_ranges(h, hhdr);
+
+    GC_rescuing_span_bytes -= skipped;
+    GC_rescuing_skipped_bytes += skipped;
+    return;
+  }
+#endif
   /*
    * The accelerated paths below ignore `hb_descr` and just scan every word
    * of the object conservatively.  That is a safe superset for length and
@@ -2337,6 +2422,9 @@ GC_push_unconditionally(struct hblk *h, const hdr *hhdr)
 
 #  if !defined(GC_DISABLE_INCREMENTAL)
   GC_n_rescuing_pages++;
+  /* A dirty page can cause a whole large object to be revisited.  This is
+     the candidate span, not an exact count of pointer words scanned. */
+  GC_rescuing_span_bytes += sz > MAXOBJBYTES ? (word)sz : HBLKSIZE;
 #  endif
   GC_objects_are_marked = TRUE;
   plim = sz > MAXOBJBYTES ? h->hb_body
