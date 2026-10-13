@@ -3723,6 +3723,7 @@ is_header_found_async(const void *p)
 #    define GC_write_fault_this_thread_inited GC_is_initialized
 #  endif
 
+
 #  ifndef DARWIN
 
 #    if !defined(MSWIN32) && !defined(MSWINCE)
@@ -3955,6 +3956,28 @@ static GC_bool soft_dirty_init(void);
 static GC_bool uffdwp_dirty_init(void);
 #    endif
 
+#    ifdef COUNT_PROTECTED_REGIONS
+/* Track protection passes for mprotect VDB.  Hash collisions conservatively
+   cause extra protection calls; they cannot hide an unprotected page. */
+STATIC MAY_THREAD_LOCAL page_hash_table GC_reprotect_dirty_pages;
+STATIC MAY_THREAD_LOCAL GC_bool GC_reprotect_previous_pass = FALSE;
+STATIC MAY_THREAD_LOCAL GC_bool GC_reprotect_skip_clean = FALSE;
+STATIC MAY_THREAD_LOCAL word GC_reprotect_previous_sections = 0;
+STATIC MAY_THREAD_LOCAL word GC_reprotect_calls = 0;
+STATIC MAY_THREAD_LOCAL word GC_reprotect_skipped = 0;
+#ifndef NO_CLOCK
+STATIC MAY_THREAD_LOCAL GC_bool GC_reprotect_profile_calls = FALSE;
+STATIC MAY_THREAD_LOCAL unsigned long GC_reprotect_syscall_ms = 0;
+STATIC MAY_THREAD_LOCAL unsigned long GC_reprotect_syscall_nsec = 0;
+#endif
+STATIC MAY_THREAD_LOCAL word GC_protected_page_count = 0;
+STATIC MAY_THREAD_LOCAL word GC_protected_range_count = 0;
+STATIC MAY_THREAD_LOCAL word GC_protected_region_bound = 0;
+STATIC MAY_THREAD_LOCAL word GC_protection_section_count = 0;
+STATIC MAY_THREAD_LOCAL GC_bool GC_protection_bound_valid = FALSE;
+static word GC_count_protected_region_bound(void);
+#    endif
+
 GC_INNER GC_bool
 GC_dirty_init(void)
 {
@@ -3965,7 +3988,17 @@ GC_dirty_init(void)
   GC_ASSERT(I_HOLD_LOCK());
 #    ifdef COUNT_PROTECTED_REGIONS
   GC_ASSERT(GC_page_size != 0);
-  if ((GC_signed_word)(GC_heapsize / (word)GC_page_size)
+  GC_reprotect_previous_pass = FALSE;
+#      ifndef NO_CLOCK
+  /* Per-call clocks can materially perturb short mprotect calls on ARM.
+     Enable them only in separate profiling runs, never score runs. */
+  GC_reprotect_profile_calls = GETENV("GC_PROFILE_MPROTECT") != NULL;
+#      endif
+  GC_protection_bound_valid = FALSE;
+  GC_protected_region_bound = GC_get_adaptive_incremental()
+                                  ? GC_count_protected_region_bound()
+                                  : GC_heapsize / (word)GC_page_size;
+  if ((GC_signed_word)GC_protected_region_bound
       >= ((GC_signed_word)GC_UNMAPPED_REGIONS_SOFT_LIMIT
           - GC_num_unmapped_regions)
              * 2) {
@@ -4089,6 +4122,9 @@ GC_unprotect_all_heap(void)
 
   GC_ASSERT(I_HOLD_LOCK());
   GC_ASSERT(GC_auto_incremental);
+#    ifdef COUNT_PROTECTED_REGIONS
+  GC_reprotect_previous_pass = FALSE;
+#    endif
   for (i = 0; i < GC_n_heap_sects; i++) {
     MP_PROTECT_INNER(GC_heap_sects[i].hs_start, GC_heap_sects[i].hs_bytes,
                      TRUE);
@@ -4114,7 +4150,32 @@ GC_is_mprotect_vdb(void)
 GC_INNER void
 GC_handle_protected_regions_limit(void)
 {
+  word region_bound;
+  GC_signed_word region_limit;
   GC_ASSERT(GC_page_size != 0);
+  if (GC_get_adaptive_incremental()) {
+    if (!GC_protection_bound_valid)
+      GC_protected_region_bound = GC_count_protected_region_bound();
+    region_bound = GC_protected_region_bound;
+    /* Newly added sections are writable until the next protection pass. */
+    if (GC_n_heap_sects > GC_protection_section_count)
+      region_bound += GC_n_heap_sects - GC_protection_section_count;
+  } else {
+    region_bound = GC_heapsize / (word)GC_page_size;
+  }
+  region_limit = ((GC_signed_word)GC_UNMAPPED_REGIONS_SOFT_LIMIT
+                  - GC_num_unmapped_regions) * 2;
+  if (GC_get_adaptive_incremental() && GC_auto_incremental
+      && !IS_NON_MPROTECT_VDB() && !GC_is_full_gc && region_limit > 0
+      && region_bound >= (word)(region_limit - region_limit / 4)) {
+    /* Give full incremental marking time to release retained old blocks
+       before the protected mapping bound forces VDB shutdown.  This is
+       actual protection pressure, not growth of partial mark counts. */
+    GC_need_full_gc = TRUE;
+    GC_COND_LOG_PRINTF(
+        "Adaptive protection pressure: region-bound %lu, region-limit %ld, request-full 1\n",
+        (unsigned long)region_bound, (long)region_limit);
+  }
   /*
    * To prevent exceeding the limit of `vm.max_map_count`, the most
    * trivial (though highly restrictive) way is to turn off the
@@ -4122,14 +4183,15 @@ GC_handle_protected_regions_limit(void)
    * of pages in the heap reaches that limit.
    */
   if (GC_auto_incremental && !IS_NON_MPROTECT_VDB()
-      && (GC_signed_word)(GC_heapsize / (word)GC_page_size)
-             >= ((GC_signed_word)GC_UNMAPPED_REGIONS_SOFT_LIMIT
-                 - GC_num_unmapped_regions)
-                    * 2) {
+      && (GC_signed_word)region_bound >= region_limit) {
     GC_unprotect_all_heap();
 #    ifdef DARWIN
     GC_task_self = 0;
 #    endif
+    /* The limit may be reached during a stopped partial mark, including
+       before GC_initiate_gc selects its dirty-rescuer state.  Rescan all
+       marked objects and roots once protection can no longer track writes. */
+    GC_invalidate_mark_state();
     GC_incremental = FALSE;
     WARN("GC incremental mode is turned off"
          " to prevent hitting VM maps limit\n",
@@ -5143,7 +5205,7 @@ uffdwp_register_heap_lazy(void)
 
 #if defined(MPROTECT_VDB) || defined(UFFDWP_VDB)
 STATIC void
-GC_protect_heap(void)
+GC_visit_protection_ranges(void (*visit)(ptr_t, size_t))
 {
   size_t i;
 
@@ -5163,7 +5225,7 @@ GC_protect_heap(void)
      * differs from `HBLKSIZE`.
      */
     if (GC_page_size != HBLKSIZE) {
-      PROTECT(start, len);
+      visit(start, len);
       continue;
     }
 #  endif
@@ -5207,9 +5269,9 @@ GC_protect_heap(void)
            * Adjacent free blocks might be protected too because
            * of the alignment by the page size.
            */
-          PROTECT(current_start, cur_aligned - (ptr_t)current_start);
+          visit((ptr_t)current_start, (size_t)(cur_aligned - (ptr_t)current_start));
 #  else
-          PROTECT(current_start, (ptr_t)current - (ptr_t)current_start);
+          visit((ptr_t)current_start, (size_t)((ptr_t)current - (ptr_t)current_start));
 #  endif
         }
         if (ADDR_GE((ptr_t)current, limit))
@@ -5221,6 +5283,123 @@ GC_protect_heap(void)
     }
   }
 }
+
+#  if defined(COUNT_PROTECTED_REGIONS) && defined(MPROTECT_VDB)
+STATIC void
+GC_count_protection_range(ptr_t start, size_t len)
+{
+  UNUSED_ARG(start);
+  GC_protected_page_count += (word)(len / GC_page_size);
+  ++GC_protected_range_count;
+}
+
+static word
+GC_count_protected_region_bound(void)
+{
+  GC_protected_page_count = 0;
+  GC_protected_range_count = 0;
+  GC_visit_protection_ranges(GC_count_protection_range);
+  /* A range containing P pages can split into at most P VMAs as pages
+     become writable.  Also allow an RW gap per protection range and an
+     exterior RW interval per heap section.  Unmapped regions are budgeted
+     separately by GC_handle_protected_regions_limit(). */
+  GC_protection_section_count = GC_n_heap_sects;
+  GC_protection_bound_valid = TRUE;
+  return GC_protected_page_count + GC_protected_range_count + GC_n_heap_sects;
+}
+#  endif
+
+STATIC void
+GC_protect_range(ptr_t start, size_t len)
+{
+#  if defined(COUNT_PROTECTED_REGIONS) && defined(MPROTECT_VDB)
+  if (GC_reprotect_skip_clean) {
+    ptr_t p;
+    for (p = start; ADDR_LT(p, start + len); p += HBLKSIZE) {
+      if (get_pht_entry_from_index(GC_reprotect_dirty_pages, PHT_HASH(p)))
+        break;
+    }
+    if (ADDR_GE(p, start + len)) {
+      ++GC_reprotect_skipped;
+      return;
+    }
+  }
+  ++GC_reprotect_calls;
+#    ifndef NO_CLOCK
+  if (GC_PRINT_STATS_FLAG && GC_reprotect_profile_calls) {
+    CLOCK_TYPE before, after;
+    GET_TIME(before);
+    PROTECT(start, len);
+    GET_TIME(after);
+    GC_reprotect_syscall_ms += MS_TIME_DIFF(after, before);
+    GC_reprotect_syscall_nsec += NS_FRAC_TIME_DIFF(after, before);
+    GC_reprotect_syscall_ms += GC_reprotect_syscall_nsec / 1000000;
+    GC_reprotect_syscall_nsec %= 1000000;
+    return;
+  }
+#    endif
+#  endif
+  PROTECT(start, len);
+}
+
+STATIC void
+GC_protect_heap(void)
+{
+#  ifndef NO_CLOCK
+  CLOCK_TYPE start = CLOCK_TYPE_INITIALIZER;
+  GC_bool timed = GC_PRINT_STATS_FLAG;
+  if (timed)
+    GET_TIME(start);
+#  endif
+#  if defined(COUNT_PROTECTED_REGIONS) && defined(MPROTECT_VDB)
+  if (GC_get_adaptive_incremental() && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()) {
+    GC_protected_region_bound = GC_count_protected_region_bound();
+    GC_COND_LOG_PRINTF("Mprotect VMA budget: protected-candidate-pages %lu, protection-ranges %lu, mapped-region-bound %lu, heap-pages %lu, unmapped-regions %ld, region-soft-limit %u\n",
+                       (unsigned long)GC_protected_page_count,
+                       (unsigned long)GC_protected_range_count,
+                       (unsigned long)GC_protected_region_bound,
+                       (unsigned long)(GC_heapsize / (word)GC_page_size),
+                       (long)GC_num_unmapped_regions,
+                       (unsigned)GC_UNMAPPED_REGIONS_SOFT_LIMIT);
+    GC_handle_protected_regions_limit();
+    if (!GC_incremental)
+      return;
+  } else {
+    GC_protection_bound_valid = FALSE;
+  }
+#  endif
+#  if defined(COUNT_PROTECTED_REGIONS) && defined(MPROTECT_VDB)
+  GC_reprotect_calls = 0;
+  GC_reprotect_skipped = 0;
+#    ifndef NO_CLOCK
+  GC_reprotect_syscall_ms = 0;
+  GC_reprotect_syscall_nsec = 0;
+#    endif
+#  endif
+  GC_visit_protection_ranges(GC_protect_range);
+#  if defined(COUNT_PROTECTED_REGIONS) && defined(MPROTECT_VDB)
+  GC_reprotect_previous_pass = !GC_manual_vdb && !IS_NON_MPROTECT_VDB();
+  GC_reprotect_previous_sections = GC_n_heap_sects;
+  GC_reprotect_skip_clean = FALSE;
+  GC_COND_LOG_PRINTF("Mprotect calls: %lu, clean ranges skipped: %lu\n",
+                     (unsigned long)GC_reprotect_calls,
+                     (unsigned long)GC_reprotect_skipped);
+#    ifndef NO_CLOCK
+  if (GC_reprotect_profile_calls)
+    GC_COND_LOG_PRINTF("Mprotect syscalls took %lu ms %lu ns\n",
+                       GC_reprotect_syscall_ms, GC_reprotect_syscall_nsec);
+#    endif
+#  endif
+#  ifndef NO_CLOCK
+  if (timed) {
+    CLOCK_TYPE now;
+    GET_TIME(now);
+    GC_COND_LOG_PRINTF("Mprotect heap protection took %lu ms %lu ns\n",
+                       MS_TIME_DIFF(now, start), NS_FRAC_TIME_DIFF(now, start));
+  }
+#  endif
+}
+
 #endif
 
 #ifndef NO_MANUAL_VDB
@@ -5257,6 +5436,25 @@ GC_isolate_dirty_page(const void *p)
 #endif
 
 #ifndef GC_DISABLE_INCREMENTAL
+/* History is only a scheduling hint.  Hash collisions and page reuse may
+ * overestimate heat; the marker still scans every currently dirty page.
+ * Aggregate all snapshots belonging to one collection before aging them.
+ */
+STATIC MAY_THREAD_LOCAL page_hash_table GC_adaptive_dirty_history;
+STATIC MAY_THREAD_LOCAL page_hash_table GC_adaptive_previous_dirty;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_history_gc_no = GC_WORD_MAX;
+
+STATIC void
+GC_adaptive_age_dirty_history(void)
+{
+  if (GC_adaptive_history_gc_no != GC_gc_no) {
+    BCOPY(GC_adaptive_dirty_history, GC_adaptive_previous_dirty,
+          sizeof(GC_adaptive_dirty_history));
+    BZERO(GC_adaptive_dirty_history, sizeof(GC_adaptive_dirty_history));
+    GC_adaptive_history_gc_no = GC_gc_no;
+  }
+}
+
 GC_INNER void
 GC_read_dirty(GC_bool output_unneeded)
 {
@@ -5272,9 +5470,31 @@ GC_read_dirty(GC_bool output_unneeded)
   )
 #  endif
   {
+    if (GC_get_adaptive_incremental()) {
+      size_t i;
+
+      GC_adaptive_age_dirty_history();
+      for (i = 0; i < PHT_SIZE; ++i)
+        GC_adaptive_dirty_history[i] |= GC_dirty_pages[i];
+    }
     if (!output_unneeded)
       BCOPY(CAST_AWAY_VOLATILE_PVOID(GC_dirty_pages), GC_grungy_pages,
             sizeof(GC_dirty_pages));
+#  if defined(COUNT_PROTECTED_REGIONS) && defined(MPROTECT_VDB) \
+      && !defined(CHECK_SOFT_VDB)
+    /* Skip only ranges known to have been protected in the preceding
+       pass.  New pointer allocations and allocator unprotection dirty
+       their pages via GC_remove_protection(); fault handlers do likewise.
+       Always protect everything on the first pass or after heap growth.
+       Snapshot even for full marks, which otherwise discard dirty bits. */
+    GC_reprotect_skip_clean = GC_reprotect_previous_pass
+                              && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()
+                              && GC_page_size == HBLKSIZE
+                              && GC_reprotect_previous_sections == GC_n_heap_sects;
+    if (GC_reprotect_skip_clean)
+      BCOPY(CAST_AWAY_VOLATILE_PVOID(GC_dirty_pages), GC_reprotect_dirty_pages,
+            sizeof(GC_dirty_pages));
+#  endif
     BZERO(CAST_AWAY_VOLATILE_PVOID(GC_dirty_pages), sizeof(GC_dirty_pages));
 #  if defined(MPROTECT_VDB) || defined(UFFDWP_VDB)
     if (!GC_manual_vdb) {
@@ -5315,6 +5535,53 @@ GC_is_vdb_for_static_roots(void)
 #    endif
 }
 #  endif
+
+GC_INNER word
+GC_current_dirty_bytes(word *hot_bytes)
+{
+  word used = GC_heapsize - GC_large_free_bytes;
+  word count = 0;
+  word hot = 0;
+  size_t i;
+
+  GC_ASSERT(I_HOLD_LOCK());
+  *hot_bytes = 0;
+#  ifdef MPROTECT_VDB
+  if (!GC_manual_vdb && IS_NON_MPROTECT_VDB())
+    return used;
+#  else
+  if (!GC_manual_vdb)
+    return used;
+#  endif
+  GC_isolate_vdb_drain_pending();
+  GC_adaptive_age_dirty_history();
+  for (i = 0; i < PHT_SIZE; ++i) {
+    word bits = GC_dirty_pages[i];
+    word repeated;
+
+    if (bits == 0)
+      continue;
+    repeated = bits & GC_adaptive_previous_dirty[i];
+#  if defined(__GNUC__) || defined(__clang__)
+    count += (word)__builtin_popcountl((unsigned long)bits);
+    if (repeated != 0)
+      hot += (word)__builtin_popcountl((unsigned long)repeated);
+#  else
+    while (bits != 0) {
+      bits &= bits - 1;
+      ++count;
+    }
+    while (repeated != 0) {
+      repeated &= repeated - 1;
+      ++hot;
+    }
+#  endif
+  }
+  /* Colliding heap blocks share one bit; this is an estimate, not an exact
+     count.  Clamp before multiplying to avoid overflow on 32-bit builds. */
+  *hot_bytes = hot >= divHBLKSZ(used) ? used : hot * HBLKSIZE;
+  return count >= divHBLKSZ(used) ? used : count * HBLKSIZE;
+}
 
 GC_INNER GC_bool
 GC_page_was_dirty(const struct hblk *h)
@@ -5622,6 +5889,8 @@ GC_INNER void
 GC_dirty_update_child(void)
 {
   GC_ASSERT(I_HOLD_LOCK());
+  /* The child cannot inherit a deferred request after its VDB is torn down. */
+  GC_incremental_start_pending = FALSE;
   if (0 == GC_task_self) {
     /* The GC incremental mode is off. */
     return;
@@ -5629,7 +5898,8 @@ GC_dirty_update_child(void)
 
   GC_ASSERT(GC_mprotect_state == GC_MP_NORMAL);
   GC_task_self = mach_task_self(); /*< needed by `UNPROTECT()` */
-  GC_unprotect_all_heap();
+  if (GC_auto_incremental)
+    GC_unprotect_all_heap();
 
   /* Restore the old task exception ports. */
   /* TODO: Should we do it in `fork_prepare_proc`/`fork_parent_proc`? */

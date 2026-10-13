@@ -824,7 +824,59 @@ GC_envfile_getenv(const char *name)
 GC_API int GC_CALL
 GC_is_init_called(void)
 {
+#if defined(ENABLE_TLS_ACCESS_BY_ADDRESS) \
+    || defined(ENABLE_TLS_ACCESS_BY_PTHREAD_KEY)
+  /* The optimized TLS slot/offset is established by GC_init itself. */
+  return (int)GC_arrays_instance._is_initialized;
+#else
   return (int)GC_is_initialized;
+#endif
+}
+
+STATIC unsigned long
+GC_time_limit_from_env(unsigned long value)
+{
+#if !defined(GC_DISABLE_INCREMENTAL) && !defined(NO_CLOCK)
+  const char *str = GETENV("GC_PAUSE_TIME_TARGET");
+
+  if (str != NULL) {
+    long time_limit = atol(str);
+
+    if (time_limit > 0)
+      value = (unsigned long)time_limit;
+  }
+#endif
+  return value;
+}
+
+STATIC int
+GC_full_freq_from_env(int value)
+{
+#ifndef SMALL_CONFIG
+  const char *str = GETENV("GC_FULL_FREQUENCY");
+
+  if (str != NULL) {
+    int full_freq = atoi(str);
+
+    if (full_freq > 0)
+      value = full_freq;
+  }
+#endif
+  return value;
+}
+
+GC_API unsigned long GC_CALL
+GC_get_time_limit_for_init(void)
+{
+  return GC_is_init_called() ? GC_time_limit
+                            : GC_time_limit_from_env(GC_time_limit);
+}
+
+GC_API int GC_CALL
+GC_get_full_freq_for_init(void)
+{
+  return GC_is_init_called() ? GC_full_freq
+                            : GC_full_freq_from_env(GC_full_freq);
 }
 
 #if defined(GC_WIN32_THREADS) \
@@ -1624,31 +1676,8 @@ GC_init(void)
     }
   }
 #endif
-#if !defined(GC_DISABLE_INCREMENTAL) && !defined(NO_CLOCK)
-  {
-    const char *str = GETENV("GC_PAUSE_TIME_TARGET");
-
-    if (str != NULL) {
-      long time_limit = atol(str);
-
-      if (time_limit > 0) {
-        GC_time_limit = (unsigned long)time_limit;
-      }
-    }
-  }
-#endif
-#ifndef SMALL_CONFIG
-  {
-    const char *str = GETENV("GC_FULL_FREQUENCY");
-
-    if (str != NULL) {
-      int full_freq = atoi(str);
-
-      if (full_freq > 0)
-        GC_full_freq = full_freq;
-    }
-  }
-#endif
+  GC_time_limit = GC_time_limit_from_env(GC_time_limit);
+  GC_full_freq = GC_full_freq_from_env(GC_full_freq);
 #ifndef NO_BLACK_LISTING
   {
     char const *str = GETENV("GC_LARGE_ALLOC_WARN_INTERVAL");
@@ -1808,6 +1837,23 @@ GC_init(void)
 #ifndef GC_DISABLE_INCREMENTAL
   if (GC_incremental || GETENV("GC_ENABLE_INCREMENTAL") != NULL) {
     set_incremental_mode_on();
+#  if defined(MPROTECT_VDB) && !defined(CHECK_SOFT_VDB)
+    if (GC_incremental && GC_get_actual_vdb() == GC_VDB_MPROTECT) {
+      const char *threshold = GETENV("GC_INCREMENTAL_START_THRESHOLD");
+
+      if (threshold != NULL) {
+        word bytes = GC_parse_mem_size_arg(threshold);
+
+        if (bytes != 0 && bytes != GC_WORD_MAX) {
+          GC_incremental_start_threshold = bytes;
+          GC_incremental_start_pending = TRUE;
+          GC_incremental = FALSE;
+          GC_COND_LOG_PRINTF("Incremental mprotect deferred until occupied heap reaches %lu bytes after a full collection\n",
+                             (unsigned long)bytes);
+        }
+      }
+    }
+#  endif
     GC_ASSERT(0 == GC_bytes_allocd);
   }
 #endif
@@ -1948,6 +1994,16 @@ GC_enable_incremental(void)
    * pointless.
    */
   if (!GC_find_leak_inner && NULL == GETENV("GC_DISABLE_INCREMENTAL")) {
+#  if defined(ENABLE_TLS_ACCESS_BY_ADDRESS) \
+      || defined(ENABLE_TLS_ACCESS_BY_PTHREAD_KEY)
+    /* GC_arrays uses a TLS slot/offset established by GC_init().  Before
+       that, access the actual TLS instance, as GC_init() itself does. */
+    if (!GC_arrays_instance._is_initialized) {
+      GC_arrays_instance._incremental = TRUE;
+      GC_init();
+      return;
+    }
+#  endif
     LOCK();
     if (!GC_incremental) {
 #  if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
