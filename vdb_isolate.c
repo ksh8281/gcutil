@@ -113,6 +113,10 @@ static GC_isolate_range *range_registry = NULL;
 static size_t range_count = 0;
 STATIC MAY_THREAD_LOCAL GC_bool isolate_has_registered_ranges = FALSE;
 static size_t range_capacity = 0;
+/* Once foreign recovery has changed an owner's physical permissions,
+   its private protection bitmap is no longer sufficient to skip RO
+   syscalls.  Keep that optimization disabled for the process lifetime. */
+static GC_bool foreign_writes_seen = FALSE;
 
 static GC_isolate_mutex_t pending_lock = GC_ISOLATE_MUTEX_INITIALIZER;
 static ptr_t *pending_queue = NULL;
@@ -409,8 +413,50 @@ GC_isolate_vdb_classify_fault(const void *addr)
 }
 
 GC_INNER GC_bool
+GC_isolate_vdb_committed_bounds(const void *addr, ptr_t *start, ptr_t *end)
+{
+  ptr_t a = (ptr_t)addr;
+  GC_bool found = FALSE;
+  size_t low = 0;
+  size_t high;
+
+  GC_isolate_mutex_lock(&range_lock);
+  high = range_count;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (a < range_registry[mid].start) {
+      high = mid;
+    } else if (a >= range_registry[mid].end) {
+      low = mid + 1;
+    } else {
+      if (range_registry[mid].committed) {
+        *start = range_registry[mid].start;
+        *end = range_registry[mid].end;
+        found = TRUE;
+      }
+      break;
+    }
+  }
+  GC_isolate_mutex_unlock(&range_lock);
+  return found;
+}
+
+GC_INNER GC_bool
+GC_isolate_vdb_has_foreign_writes(void)
+{
+  GC_bool result;
+  GC_isolate_mutex_lock(&range_lock);
+  result = foreign_writes_seen;
+  GC_isolate_mutex_unlock(&range_lock);
+  return result;
+}
+
+GC_INNER GC_bool
 GC_isolate_vdb_push_pending(struct hblk *h, unsigned n)
 {
+  GC_isolate_mutex_lock(&range_lock);
+  foreign_writes_seen = TRUE;
+  GC_isolate_mutex_unlock(&range_lock);
   unsigned i;
   size_t missing = 0;
 

@@ -3171,6 +3171,11 @@ GC_remap(ptr_t start, size_t bytes)
   GC_ASSERT(GC_unmapped_bytes >= len);
   GC_unmapped_bytes -= len;
 #  endif
+#  if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+      && (defined(PREFER_MMAP_PROT_NONE) \
+          || defined(FORCE_MPROTECT_BEFORE_MADVISE))
+  GC_coarse_note_rw_remap(start_addr, (size_t)len);
+#  endif
 }
 
 GC_INNER void
@@ -3652,6 +3657,314 @@ static MAY_THREAD_LOCAL DWORD protect_junk;
 #  define PROTECT(addr, len) MP_PROTECT_INNER(addr, len, FALSE)
 #  define UNPROTECT(addr, len) MP_PROTECT_INNER(addr, len, TRUE)
 
+#  if defined(LINUX) && defined(GC_THREAD_ISOLATE)
+#    define GC_COARSE_MPROTECT
+
+/* Exact permission state, separate from the colliding dirty-page hash.
+   Only this isolate protects its sections; foreign writes can make a
+   protected bit stale in the conservative (still protected) direction.
+   libc storage is never write protected.  Grow it outside fault handlers. */
+typedef struct {
+  ptr_t start;
+  ptr_t end;
+  ptr_t owned_begin;
+  ptr_t owned_end;
+  unsigned char *protected_pages;
+} GC_coarse_section;
+
+STATIC MAY_THREAD_LOCAL GC_coarse_section *GC_coarse_sections;
+STATIC MAY_THREAD_LOCAL size_t GC_coarse_section_count;
+STATIC MAY_THREAD_LOCAL size_t GC_coarse_last_section;
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_enabled;
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_free_protected;
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_exact_protection;
+STATIC MAY_THREAD_LOCAL size_t GC_coarse_limit;
+STATIC MAY_THREAD_LOCAL word GC_coarse_skipped;
+STATIC MAY_THREAD_LOCAL word GC_coarse_syscalls;
+STATIC MAY_THREAD_LOCAL word GC_coarse_splits;
+STATIC MAY_THREAD_LOCAL word GC_coarse_dirty_pages;
+STATIC MAY_THREAD_LOCAL word GC_coarse_omitted_ranges;
+
+STATIC void
+GC_coarse_discard_cache(void)
+{
+  size_t i;
+  for (i = 0; i < GC_coarse_section_count; ++i)
+    free(GC_coarse_sections[i].protected_pages);
+  free(GC_coarse_sections);
+  GC_coarse_sections = NULL;
+  GC_coarse_section_count = GC_coarse_last_section = 0;
+  GC_coarse_enabled = FALSE;
+}
+
+GC_INNER void
+GC_coarse_protection_deinit(void)
+{
+  GC_coarse_discard_cache();
+  GC_coarse_free_protected = FALSE;
+}
+
+static int
+GC_coarse_compare_sections(const void *left, const void *right)
+{
+  const GC_coarse_section *a = (const GC_coarse_section *)left;
+  const GC_coarse_section *b = (const GC_coarse_section *)right;
+  return ADDR(a->start) < ADDR(b->start) ? -1
+         : ADDR(a->start) > ADDR(b->start) ? 1 : 0;
+}
+
+STATIC void
+GC_coarse_sync_sections(void)
+{
+  size_t i, old_count = GC_coarse_section_count;
+  GC_coarse_section *sections;
+
+  if (!GC_coarse_enabled || old_count == GC_n_heap_sects)
+    return;
+  GC_ASSERT(old_count < GC_n_heap_sects);
+  sections = (GC_coarse_section *)realloc(
+      GC_coarse_sections, GC_n_heap_sects * sizeof(*sections));
+  if (sections == NULL) {
+    GC_coarse_discard_cache();
+    return;
+  }
+  GC_coarse_sections = sections;
+  BZERO(sections + old_count,
+        (GC_n_heap_sects - old_count) * sizeof(*sections));
+  GC_coarse_section_count = GC_n_heap_sects;
+  for (i = old_count; i < GC_n_heap_sects; ++i) {
+    size_t pages = GC_heap_sects[i].hs_bytes / GC_page_size;
+    sections[i].start = GC_heap_sects[i].hs_start;
+    sections[i].end = sections[i].start + GC_heap_sects[i].hs_bytes;
+    sections[i].protected_pages = (unsigned char *)calloc((pages + 7) / 8, 1);
+    if (sections[i].protected_pages == NULL) {
+      GC_coarse_discard_cache();
+      return;
+    }
+  }
+  qsort(sections, GC_coarse_section_count, sizeof(*sections),
+        GC_coarse_compare_sections);
+  for (i = 0; i < GC_coarse_section_count;) {
+    size_t first = i, last = i + 1;
+    while (last < GC_coarse_section_count
+           && sections[last - 1].end == sections[last].start)
+      ++last;
+    for (; i < last; ++i) {
+      sections[i].owned_begin = sections[first].start;
+      sections[i].owned_end = sections[last - 1].end;
+    }
+  }
+  GC_coarse_last_section = 0;
+}
+
+static GC_coarse_section *
+GC_coarse_find_section(ptr_t address)
+{
+  size_t low = 0, high = GC_coarse_section_count;
+  GC_coarse_section *section;
+
+  if (high == 0)
+    return NULL;
+  section = &GC_coarse_sections[GC_coarse_last_section];
+  if (ADDR_GE(address, section->start) && ADDR_LT(address, section->end))
+    return section;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    section = &GC_coarse_sections[mid];
+    if (ADDR_LT(address, section->start)) {
+      high = mid;
+    } else if (ADDR_GE(address, section->end)) {
+      low = mid + 1;
+    } else {
+      GC_coarse_last_section = mid;
+      return section;
+    }
+  }
+  return NULL;
+}
+
+/* Set or clear exact physical protection bits.  Missing sections remain
+   unknown and use the original unprotection path until the next pass. */
+STATIC void
+GC_coarse_record_protection(ptr_t start, size_t len, GC_bool protected)
+{
+  ptr_t end = start + len;
+  size_t low = 0, high = GC_coarse_section_count;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (ADDR_GE(start, GC_coarse_sections[mid].end))
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  while (ADDR_LT(start, end)) {
+    GC_coarse_section *section;
+    ptr_t stop;
+    size_t first, last;
+    if (low == GC_coarse_section_count)
+      return;
+    section = &GC_coarse_sections[low++];
+    if (ADDR_GE(section->start, end))
+      return;
+    if (ADDR_LT(start, section->start))
+      start = section->start;
+    stop = ADDR_LT(end, section->end) ? end : section->end;
+    first = (size_t)(start - section->start) / GC_page_size;
+    last = (size_t)(stop - section->start) / GC_page_size;
+    while (first < last && (first & 7) != 0) {
+      unsigned char mask = (unsigned char)(1U << (first & 7));
+      if (protected)
+        section->protected_pages[first >> 3] |= mask;
+      else
+        section->protected_pages[first >> 3] &= (unsigned char)~mask;
+      ++first;
+    }
+    if (last - first >= 8) {
+      size_t bytes = (last - first) / 8;
+      memset(section->protected_pages + (first >> 3), protected ? 0xff : 0,
+             bytes);
+      first += bytes * 8;
+    }
+    while (first < last) {
+      unsigned char mask = (unsigned char)(1U << (first & 7));
+      if (protected)
+        section->protected_pages[first >> 3] |= mask;
+      else
+        section->protected_pages[first >> 3] &= (unsigned char)~mask;
+      ++first;
+    }
+    start = stop;
+  }
+}
+
+GC_INNER void
+GC_coarse_note_rw_remap(ptr_t start, size_t bytes)
+{
+  if (GC_coarse_enabled)
+    GC_coarse_record_protection(start, bytes, FALSE);
+}
+
+static GC_bool
+GC_coarse_has_permission(ptr_t start, size_t len, GC_bool protected)
+{
+  ptr_t end = start + len;
+  while (ADDR_LT(start, end)) {
+    GC_coarse_section *section = GC_coarse_find_section(start);
+    ptr_t stop;
+    size_t first, last;
+    if (section == NULL)
+      return TRUE; /* Unknown permission state must never suppress a syscall. */
+    stop = ADDR_LT(end, section->end) ? end : section->end;
+    first = (size_t)(start - section->start) / GC_page_size;
+    last = (size_t)(stop - section->start) / GC_page_size;
+    while (first < last && (first & 7) != 0) {
+      GC_bool bit = (section->protected_pages[first >> 3]
+                     & (1U << (first & 7))) != 0;
+      if (bit == protected)
+        return TRUE;
+      ++first;
+    }
+    while (last - first >= 8) {
+      unsigned char bits = section->protected_pages[first >> 3];
+      if (protected ? bits != 0 : bits != 0xff)
+        return TRUE;
+      first += 8;
+    }
+    while (first < last) {
+      GC_bool bit = (section->protected_pages[first >> 3]
+                     & (1U << (first & 7))) != 0;
+      if (bit == protected)
+        return TRUE;
+      ++first;
+    }
+    start = stop;
+  }
+  return FALSE;
+}
+
+/* Begin with the complete owned, committed interval.  mprotect can
+   change a prefix before failing, so dirty the complete attempted range
+   first, retain conservative permission bits on failure, and retry with
+   successively smaller page-aligned chunks. */
+static GC_bool
+GC_coarse_unprotect(ptr_t start, size_t len, GC_bool write_fault)
+{
+  GC_coarse_section *section;
+  ptr_t begin = start, end = start + len;
+#    if defined(PREFER_MMAP_PROT_NONE) \
+        || defined(FORCE_MPROTECT_BEFORE_MADVISE)
+  ptr_t committed_begin, committed_end;
+#    endif
+  struct hblk *page;
+  int saved_errno;
+
+  if (!GC_coarse_enabled || GC_manual_vdb || IS_NON_MPROTECT_VDB())
+    return FALSE;
+  section = GC_coarse_find_section(start);
+  if (section == NULL)
+    return FALSE;
+  if (!write_fault && !GC_coarse_has_permission(start, len, TRUE)) {
+    ++GC_coarse_skipped;
+    return TRUE;
+  }
+  saved_errno = errno;
+  if (ADDR_GE(section->owned_end, end)
+#    if defined(PREFER_MMAP_PROT_NONE) \
+        || defined(FORCE_MPROTECT_BEFORE_MADVISE)
+      && GC_isolate_vdb_committed_bounds(start, &committed_begin,
+                                        &committed_end)
+      && ADDR_GE(committed_end, end)
+#    endif
+  ) {
+#    if defined(PREFER_MMAP_PROT_NONE) \
+        || defined(FORCE_MPROTECT_BEFORE_MADVISE)
+    begin = ADDR_LT(committed_begin, section->owned_begin)
+                ? section->owned_begin : committed_begin;
+    end = ADDR_LT(section->owned_end, committed_end)
+              ? section->owned_end : committed_end;
+#    else
+    /* Linux madvise-only decommit retains the mapping and its access
+       permissions.  Changing permissions across those free pages does
+       not recommit or touch them; adjacent owned sections can be one
+       syscall.  PROT_NONE decommit must stay inside committed bounds. */
+    begin = section->owned_begin;
+    end = section->owned_end;
+#    endif
+    if ((size_t)(end - begin) > GC_coarse_limit) {
+      size_t offset = (size_t)(start - begin);
+      begin += offset / GC_coarse_limit * GC_coarse_limit;
+      if ((size_t)(end - begin) > GC_coarse_limit)
+        end = begin + GC_coarse_limit;
+      if (ADDR_LT(end, start + len)) {
+        begin = start;
+        end = start + len;
+      }
+    }
+  }
+  for (page = (struct hblk *)begin; ADDR_LT((ptr_t)page, end); ++page)
+    async_set_pht_entry_from_index(GC_dirty_pages, PHT_HASH(page));
+  GC_coarse_dirty_pages += (word)((end - begin) / GC_page_size);
+  while (ADDR_LT(begin, end)) {
+    size_t bytes = (size_t)(end - begin);
+    if (bytes > GC_coarse_limit)
+      bytes = GC_coarse_limit;
+    ++GC_coarse_syscalls;
+    if (mprotect(begin, bytes, PROT_READ | PROT_WRITE
+                                  | (GC_pages_executable ? PROT_EXEC : 0)) == 0) {
+      GC_coarse_record_protection(begin, bytes, FALSE);
+      begin += bytes;
+    } else if (bytes > GC_page_size) {
+      GC_coarse_limit = (bytes / 2) & ~(GC_page_size - 1);
+      ++GC_coarse_splits;
+    } else {
+      ABORT_ON_REMAP_FAIL("coarse mprotect vdb", begin, bytes);
+    }
+  }
+  errno = saved_errno;
+  return TRUE;
+}
+#  endif /* LINUX && GC_THREAD_ISOLATE */
+
 #  if defined(MSWIN32)
 typedef LPTOP_LEVEL_EXCEPTION_FILTER SIG_HNDLR_PTR;
 #    undef SIG_DFL
@@ -3906,7 +4219,15 @@ GC_write_fault_handler(struct _EXCEPTION_POINTERS *exc_info)
 #    endif
       }
     }
-    MP_PROTECT_INNER(h, GC_page_size, TRUE); /*< unprotect */
+#    ifdef GC_COARSE_MPROTECT
+    if (!GC_coarse_unprotect((ptr_t)h, GC_page_size, TRUE))
+#    endif
+    {
+      MP_PROTECT_INNER(h, GC_page_size, TRUE); /*< unprotect */
+#    ifdef GC_COARSE_MPROTECT
+      GC_coarse_note_rw_remap((ptr_t)h, GC_page_size);
+#    endif
+    }
     /*
      * We need to make sure that no collection occurs between the
      * unprotect action and the setting of the dirty bit.
@@ -3989,6 +4310,19 @@ GC_dirty_init(void)
 #    ifdef COUNT_PROTECTED_REGIONS
   GC_ASSERT(GC_page_size != 0);
   GC_reprotect_previous_pass = FALSE;
+#      ifdef GC_COARSE_MPROTECT
+  GC_coarse_discard_cache();
+  {
+    const char *coarse = GETENV("GC_MPROTECT_COARSE");
+    GC_coarse_enabled = coarse != NULL && coarse[0] != '0'
+                        && GC_page_size == HBLKSIZE;
+  }
+  GC_coarse_limit = (size_t)GC_WORD_MAX;
+  GC_coarse_exact_protection = TRUE;
+  GC_coarse_skipped = GC_coarse_syscalls = GC_coarse_splits
+      = GC_coarse_dirty_pages = 0;
+  GC_coarse_omitted_ranges = 0;
+#      endif
 #      ifndef NO_CLOCK
   /* Per-call clocks can materially perturb short mprotect calls on ARM.
      Enable them only in separate profiling runs, never score runs. */
@@ -4128,7 +4462,14 @@ GC_unprotect_all_heap(void)
   for (i = 0; i < GC_n_heap_sects; i++) {
     MP_PROTECT_INNER(GC_heap_sects[i].hs_start, GC_heap_sects[i].hs_bytes,
                      TRUE);
+#    ifdef GC_COARSE_MPROTECT
+    GC_coarse_record_protection(GC_heap_sects[i].hs_start,
+                                GC_heap_sects[i].hs_bytes, FALSE);
+#    endif
   }
+#    ifdef GC_COARSE_MPROTECT
+  GC_coarse_free_protected = FALSE;
+#    endif
 }
 #  endif
 
@@ -5254,6 +5595,17 @@ GC_visit_protection_ranges(void (*visit)(ptr_t, size_t))
         if (HBLK_IS_FREE(hhdr)) {
           GC_ASSERT(modHBLKSZ(hhdr->hb_sz) == 0);
           nblocks = divHBLKSZ(hhdr->hb_sz);
+#  ifdef GC_COARSE_MPROTECT
+          /* A mapped free gap can join adjacent protection runs.  It
+             contains no syscall buffers; allochblk removes protection
+             before initializing a new block, including pointer-free
+             allocations.  Never bridge a decommitted interval. */
+          if (GC_coarse_enabled && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()
+              && (hhdr->hb_flags & WAS_UNMAPPED) == 0) {
+            is_ptrfree = FALSE;
+            GC_coarse_free_protected = TRUE;
+          }
+#  endif
         } else {
           nblocks = OBJ_SZ_TO_BLOCKS(hhdr->hb_sz);
           is_ptrfree = IS_PTRFREE(hhdr);
@@ -5312,6 +5664,35 @@ GC_count_protected_region_bound(void)
 STATIC void
 GC_protect_range(ptr_t start, size_t len)
 {
+#  if defined(GC_COARSE_MPROTECT)
+  if (GC_coarse_enabled && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()
+      && len < 16 * (size_t)HBLKSIZE) {
+    ptr_t page;
+    /* A short, fragmented range costs a syscall and additional VMAs on
+       every protection pass.  Keep it conservatively dirty instead.
+       This runs after each dirty snapshot is cleared, before the clean
+       range shortcut, so a writable omitted range is never lost. */
+    for (page = start; ADDR_LT(page, start + len); page += HBLKSIZE)
+      async_set_pht_entry_from_index(GC_dirty_pages,
+                                    PHT_HASH((struct hblk *)page));
+    ++GC_coarse_omitted_ranges;
+    return;
+  }
+#  endif
+#  if defined(GC_COARSE_MPROTECT) && defined(COUNT_PROTECTED_REGIONS)
+  if (GC_coarse_enabled && GC_coarse_exact_protection
+      && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()) {
+    if (GC_isolate_vdb_has_foreign_writes()) {
+      GC_coarse_exact_protection = FALSE;
+    } else if (!GC_coarse_has_permission(start, len, FALSE)) {
+      if (!GC_isolate_vdb_has_foreign_writes()) {
+        ++GC_reprotect_skipped;
+        return;
+      }
+      GC_coarse_exact_protection = FALSE;
+    }
+  }
+#  endif
 #  if defined(COUNT_PROTECTED_REGIONS) && defined(MPROTECT_VDB)
   if (GC_reprotect_skip_clean) {
     ptr_t p;
@@ -5331,6 +5712,10 @@ GC_protect_range(ptr_t start, size_t len)
     GET_TIME(before);
     PROTECT(start, len);
     GET_TIME(after);
+#      ifdef GC_COARSE_MPROTECT
+    if (GC_coarse_enabled && !IS_NON_MPROTECT_VDB())
+      GC_coarse_record_protection(start, len, TRUE);
+#      endif
     GC_reprotect_syscall_ms += MS_TIME_DIFF(after, before);
     GC_reprotect_syscall_nsec += NS_FRAC_TIME_DIFF(after, before);
     GC_reprotect_syscall_ms += GC_reprotect_syscall_nsec / 1000000;
@@ -5340,11 +5725,19 @@ GC_protect_range(ptr_t start, size_t len)
 #    endif
 #  endif
   PROTECT(start, len);
+#  ifdef GC_COARSE_MPROTECT
+  if (GC_coarse_enabled && !IS_NON_MPROTECT_VDB())
+    GC_coarse_record_protection(start, len, TRUE);
+#  endif
 }
 
 STATIC void
 GC_protect_heap(void)
 {
+#  ifdef GC_COARSE_MPROTECT
+  if (!GC_manual_vdb && !IS_NON_MPROTECT_VDB())
+    GC_coarse_sync_sections();
+#  endif
 #  ifndef NO_CLOCK
   CLOCK_TYPE start = CLOCK_TYPE_INITIALIZER;
   GC_bool timed = GC_PRINT_STATS_FLAG;
@@ -5380,6 +5773,16 @@ GC_protect_heap(void)
 #  if defined(COUNT_PROTECTED_REGIONS) && defined(MPROTECT_VDB)
   GC_reprotect_previous_pass = !GC_manual_vdb && !IS_NON_MPROTECT_VDB();
   GC_reprotect_previous_sections = GC_n_heap_sects;
+#    ifdef GC_COARSE_MPROTECT
+  if (GC_coarse_enabled)
+    GC_COND_LOG_PRINTF("Coarse mprotect: syscalls %lu, skipped %lu, splits %lu, dirty-pages %lu, chunk-limit %lu, omitted-ranges %lu\n",
+                       (unsigned long)GC_coarse_syscalls,
+                       (unsigned long)GC_coarse_skipped,
+                       (unsigned long)GC_coarse_splits,
+                       (unsigned long)GC_coarse_dirty_pages,
+                       (unsigned long)GC_coarse_limit,
+                       (unsigned long)GC_coarse_omitted_ranges);
+#    endif
   GC_reprotect_skip_clean = FALSE;
   GC_COND_LOG_PRINTF("Mprotect calls: %lu, clean ranges skipped: %lu\n",
                      (unsigned long)GC_reprotect_calls,
@@ -5643,8 +6046,28 @@ GC_remove_protection(struct hblk *h, size_t nblocks, GC_bool is_ptrfree)
    * function on Windows, see relevant `GC_stop_world` for the details.
    */
 #    ifdef DONT_PROTECT_PTRFREE
-  if (is_ptrfree)
+  if (is_ptrfree) {
+#      ifdef GC_COARSE_MPROTECT
+    /* Coarse protection may cover free blocks.  Remove it before a
+       pointer-free block is initialized or used as a syscall buffer. */
+    /* Keep this obligation after cache allocation failure: an untouched
+       large atomic allocation must also be writable by native syscalls. */
+    if ((GC_coarse_enabled || GC_coarse_free_protected)
+        && GC_auto_incremental && !GC_manual_vdb
+        && !IS_NON_MPROTECT_VDB()) {
+      struct hblk *first = HBLK_PAGE_ALIGNED(h);
+      ptr_t end = PTR_ALIGN_UP((ptr_t)(h + nblocks), GC_page_size);
+      size_t bytes = (size_t)(end - (ptr_t)first);
+      if ((!GC_coarse_enabled
+           || GC_coarse_has_permission((ptr_t)first, bytes, TRUE))
+          && !GC_coarse_unprotect((ptr_t)first, bytes, FALSE)) {
+        UNPROTECT(first, bytes);
+        GC_coarse_note_rw_remap((ptr_t)first, bytes);
+      }
+    }
+#      endif
     return;
+  }
 #    endif
   if (!GC_auto_incremental)
     return;
@@ -5678,7 +6101,17 @@ GC_remove_protection(struct hblk *h, size_t nblocks, GC_bool is_ptrfree)
         async_set_pht_entry_from_index(GC_dirty_pages, index);
       }
     }
-    UNPROTECT(h_trunc, h_end - (ptr_t)h_trunc);
+#    ifdef GC_COARSE_MPROTECT
+    if (!GC_coarse_unprotect((ptr_t)h_trunc,
+                            (size_t)(h_end - (ptr_t)h_trunc), FALSE))
+#    endif
+    {
+      UNPROTECT(h_trunc, h_end - (ptr_t)h_trunc);
+#    ifdef GC_COARSE_MPROTECT
+      GC_coarse_note_rw_remap((ptr_t)h_trunc,
+                             (size_t)(h_end - (ptr_t)h_trunc));
+#    endif
+    }
   }
 #  else
   /* Ignore write hints.  They do not help us here. */

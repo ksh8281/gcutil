@@ -2111,6 +2111,9 @@ GC_deinit(void)
    * thread create/destroy cycles.
    */
   GC_isolate_vdb_deinit();
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+  GC_coarse_protection_deinit();
+#endif
 
 #  if defined(ESCARGOT_USE_32BIT_IN_64BIT)
   GC_release_cage();

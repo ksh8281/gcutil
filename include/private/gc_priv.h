@@ -4002,6 +4002,11 @@ GC_API_PATCHABLE void GC_dirty_inner(const void *p);
  */
 GC_INNER GC_bool GC_dirty_init(void);
 
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+GC_INNER void GC_coarse_protection_deinit(void);
+GC_INNER void GC_coarse_note_rw_remap(ptr_t start, size_t bytes);
+#endif
+
 #  ifdef UFFDWP_VDB
 /*
  * Release whatever `GC_dirty_init()` allocated for the calling thread
