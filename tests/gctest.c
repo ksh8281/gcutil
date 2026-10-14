@@ -1599,6 +1599,93 @@ test_isolate_committed_ranges(void)
   GC_free(allocation);
   GC_printf("Tested isolate committed ranges against block state oracle\n");
 }
+#  if defined(LINUX) && !defined(GC_DISABLE_INCREMENTAL)
+static GC_bool
+is_test_page_writable(const volatile unsigned char *page)
+{
+  FILE *maps = fopen("/proc/self/maps", "r");
+  char line[512], permissions[5];
+  unsigned long first, last;
+  GC_bool found = FALSE, writable = FALSE;
+
+  TEST_ASSERT(maps != NULL);
+  while (fgets(line, sizeof(line), maps) != NULL) {
+    if (sscanf(line, "%lx-%lx %4s", &first, &last, permissions) == 3
+        && (GC_uintptr_t)page >= first && (GC_uintptr_t)page < last) {
+      found = TRUE;
+      writable = permissions[1] == 'w';
+      break;
+    }
+  }
+  fclose(maps);
+  TEST_ASSERT(found);
+  return writable;
+}
+
+static unsigned
+test_write_and_wait_for_protection(volatile unsigned char *page)
+{
+  unsigned count;
+
+  TEST_ASSERT(!is_test_page_writable(page));
+  *page = (unsigned char)(*page + 1);
+  TEST_ASSERT(is_test_page_writable(page));
+  for (count = 0; count <= 33; ++count) {
+    GC_gcollect();
+    if (!is_test_page_writable(page))
+      return count;
+  }
+  TEST_ASSERT(FALSE);
+  return 0;
+}
+
+/* Observe real permissions while repeated writes increase the grace
+   period.  The owning base remains in a volatile stack slot throughout;
+   the derived probe address is not needed to keep the allocation alive. */
+static void
+test_isolate_mprotect_aging(void)
+{
+  const char *coarse = getenv("GC_MPROTECT_COARSE");
+  void *volatile allocation;
+  volatile unsigned char *page;
+  unsigned count, first_grace, round;
+  unsigned long saved_time = GC_get_time_limit();
+  int saved_frequency = GC_get_full_freq();
+  int saved_adaptive = GC_get_adaptive_incremental();
+
+  if (GC_get_actual_vdb() != GC_VDB_MPROTECT || coarse == NULL
+      || coarse[0] == '0' || GC_page_size != HBLKSIZE)
+    return;
+  GC_set_time_limit(GC_TIME_UNLIMITED);
+  GC_set_full_freq(0);
+  GC_set_adaptive_incremental(0);
+  allocation = GC_malloc(2 * 1024 * 1024);
+  TEST_ASSERT(allocation != NULL);
+  page = (volatile unsigned char *)PTR_ALIGN_UP(
+      (ptr_t)allocation + 128 * HBLKSIZE, GC_page_size);
+  for (count = 0; count <= 33 && is_test_page_writable(page); ++count)
+    GC_gcollect();
+  TEST_ASSERT(!is_test_page_writable(page));
+  first_grace = test_write_and_wait_for_protection(page);
+  TEST_ASSERT(first_grace >= 2 && first_grace <= 16
+              && (first_grace & (first_grace - 1)) == 0);
+  for (round = 2; round <= 5; ++round) {
+    unsigned expected = 1U << round;
+    if (expected < first_grace)
+      expected = first_grace;
+    TEST_ASSERT(test_write_and_wait_for_protection(page) == expected);
+  }
+  GC_gcollect();
+  GC_gcollect();
+  TEST_ASSERT(test_write_and_wait_for_protection(page) == first_grace);
+  GC_free((void *)allocation);
+  allocation = NULL;
+  GC_set_adaptive_incremental(saved_adaptive);
+  GC_set_full_freq(saved_frequency);
+  GC_set_time_limit(saved_time);
+  GC_printf("Tested isolate mprotect grace growth and cold-page reset\n");
+}
+#  endif
 #endif
 
 static void
@@ -2573,6 +2660,9 @@ main(void)
   enable_incremental_mode();
 #if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
   test_isolate_committed_ranges();
+#  if defined(LINUX) && !defined(GC_DISABLE_INCREMENTAL)
+  test_isolate_mprotect_aging();
+#  endif
 #endif
   GC_set_min_bytes_allocd(1);
   TEST_ASSERT(GC_get_min_bytes_allocd() == 1);

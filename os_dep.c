@@ -3683,6 +3683,7 @@ typedef struct {
 
 STATIC MAY_THREAD_LOCAL GC_coarse_section *GC_coarse_sections;
 STATIC MAY_THREAD_LOCAL size_t GC_coarse_section_count;
+STATIC MAY_THREAD_LOCAL size_t GC_coarse_section_capacity;
 STATIC MAY_THREAD_LOCAL size_t GC_coarse_last_section;
 STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_enabled;
 STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_free_protected;
@@ -3705,7 +3706,8 @@ GC_coarse_discard_cache(void)
   }
   free(GC_coarse_sections);
   GC_coarse_sections = NULL;
-  GC_coarse_section_count = GC_coarse_last_section = 0;
+  GC_coarse_section_count = GC_coarse_section_capacity
+      = GC_coarse_last_section = 0;
   GC_coarse_enabled = FALSE;
 }
 
@@ -3714,15 +3716,6 @@ GC_coarse_protection_deinit(void)
 {
   GC_coarse_discard_cache();
   GC_coarse_free_protected = FALSE;
-}
-
-static int
-GC_coarse_compare_sections(const void *left, const void *right)
-{
-  const GC_coarse_section *a = (const GC_coarse_section *)left;
-  const GC_coarse_section *b = (const GC_coarse_section *)right;
-  return ADDR(a->start) < ADDR(b->start) ? -1
-         : ADDR(a->start) > ADDR(b->start) ? 1 : 0;
 }
 
 STATIC void
@@ -3734,13 +3727,30 @@ GC_coarse_sync_sections(void)
   if (!GC_coarse_enabled || old_count == GC_n_heap_sects)
     return;
   GC_ASSERT(old_count < GC_n_heap_sects);
-  sections = (GC_coarse_section *)realloc(
-      GC_coarse_sections, GC_n_heap_sects * sizeof(*sections));
-  if (sections == NULL) {
-    GC_coarse_discard_cache();
-    return;
+  sections = GC_coarse_sections;
+  if (GC_n_heap_sects > GC_coarse_section_capacity) {
+    size_t capacity = GC_coarse_section_capacity != 0
+                          ? GC_coarse_section_capacity : 16;
+    if (GC_n_heap_sects > GC_SIZE_MAX / sizeof(*sections)) {
+      GC_coarse_discard_cache();
+      return;
+    }
+    while (capacity < GC_n_heap_sects) {
+      if (capacity > GC_SIZE_MAX / 2 / sizeof(*sections)) {
+        capacity = GC_n_heap_sects;
+        break;
+      }
+      capacity *= 2;
+    }
+    sections = (GC_coarse_section *)realloc(
+        sections, capacity * sizeof(*sections));
+    if (sections == NULL) {
+      GC_coarse_discard_cache();
+      return;
+    }
+    GC_coarse_sections = sections;
+    GC_coarse_section_capacity = capacity;
   }
-  GC_coarse_sections = sections;
   BZERO(sections + old_count,
         (GC_n_heap_sects - old_count) * sizeof(*sections));
   GC_coarse_section_count = GC_n_heap_sects;
@@ -3754,14 +3764,23 @@ GC_coarse_sync_sections(void)
       GC_coarse_discard_cache();
       return;
     }
-    {
-      size_t page;
-      for (page = 0; page < pages; ++page)
-        sections[i].history[page].updated_gc_no = GC_gc_no;
+    /* Zero history is already idle and writable.  Stamp pages only when
+       their history is first used; atomic pages may never need it. */
+    if (i != 0 && ADDR_LT(sections[i].start, sections[i - 1].start)) {
+      GC_coarse_section added = sections[i];
+      size_t low = 0, high = i;
+      while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (ADDR_LT(sections[mid].start, added.start))
+          low = mid + 1;
+        else
+          high = mid;
+      }
+      memmove(sections + low + 1, sections + low,
+              (i - low) * sizeof(*sections));
+      sections[low] = added;
     }
   }
-  qsort(sections, GC_coarse_section_count, sizeof(*sections),
-        GC_coarse_compare_sections);
   for (i = 0; i < GC_coarse_section_count;) {
     size_t first = i, last = i + 1;
     while (last < GC_coarse_section_count
@@ -3802,15 +3821,15 @@ GC_coarse_find_section(ptr_t address)
 }
 
 STATIC void
-GC_coarse_age_page(GC_coarse_section *section, size_t page)
+GC_coarse_age_page(GC_coarse_section *section, size_t page, word gc_no)
 {
   GC_coarse_page *state = &section->history[page];
-  word elapsed = GC_gc_no - state->updated_gc_no;
+  word elapsed = gc_no - state->updated_gc_no;
   if (elapsed == 0)
     return;
   if (elapsed > 32)
     elapsed = 32;
-  state->updated_gc_no = GC_gc_no;
+  state->updated_gc_no = gc_no;
   state->delay = state->delay > elapsed
                      ? (unsigned char)(state->delay - elapsed) : 0;
   if ((section->protected_pages[page >> 3] & (1U << (page & 7))) != 0) {
@@ -3824,17 +3843,26 @@ GC_coarse_age_page(GC_coarse_section *section, size_t page)
 }
 
 STATIC void
-GC_coarse_advance_age(void)
+GC_coarse_advance_age(word gc_no)
 {
   size_t i;
-  if (!GC_coarse_enabled || GC_coarse_age_gc_no == GC_gc_no)
+  word previous = GC_coarse_age_gc_no;
+  if (!GC_coarse_enabled || previous == gc_no)
     return;
-  GC_coarse_age_gc_no = GC_gc_no;
+  GC_coarse_age_gc_no = gc_no;
+  /* Ordinary passes age only the pages whose state they inspect.  On a
+     counter wrap, settle all older history before the new epoch records
+     writes: an untouched timestamp could otherwise alias this GC. */
+  if (gc_no > previous)
+    return;
   for (i = 0; i < GC_coarse_section_count; ++i) {
     GC_coarse_section *section = &GC_coarse_sections[i];
     size_t page, pages = (size_t)(section->end - section->start) / GC_page_size;
-    for (page = 0; page < pages; ++page)
-      GC_coarse_age_page(section, page);
+    for (page = 0; page < pages; ++page) {
+      if (section->history[page].updated_gc_no == gc_no)
+        section->history[page].updated_gc_no = gc_no - 32;
+      GC_coarse_age_page(section, page, gc_no);
+    }
   }
 }
 
@@ -3847,8 +3875,10 @@ GC_coarse_note_activity(ptr_t start, size_t bytes, GC_bool fault,
 {
   ptr_t end = start + bytes;
   size_t i;
+  word gc_no = GC_gc_no;
   if (!GC_coarse_enabled || GC_manual_vdb || IS_NON_MPROTECT_VDB())
     return;
+  GC_coarse_advance_age(gc_no);
   for (i = 0; i < GC_coarse_section_count; ++i) {
     GC_coarse_section *section = &GC_coarse_sections[i];
     ptr_t first, last;
@@ -3864,7 +3894,7 @@ GC_coarse_note_activity(ptr_t start, size_t bytes, GC_bool fault,
     for (; page < limit; ++page) {
       GC_coarse_page *state = &section->history[page];
       unsigned hold = 16;
-      GC_coarse_age_page(section, page);
+      GC_coarse_age_page(section, page, gc_no);
       if (fault) {
         if (state->probed) {
           if (foreign || state->protected_cycles <= 1) {
@@ -3890,6 +3920,8 @@ GC_coarse_record_protection(ptr_t start, size_t len, GC_bool protected)
 {
   ptr_t end = start + len;
   size_t low = 0, high = GC_coarse_section_count;
+  word gc_no = GC_gc_no;
+  GC_coarse_advance_age(gc_no);
   while (low < high) {
     size_t mid = low + (high - low) / 2;
     if (ADDR_GE(start, GC_coarse_sections[mid].end))
@@ -3913,9 +3945,23 @@ GC_coarse_record_protection(ptr_t start, size_t len, GC_bool protected)
     last = (size_t)(stop - section->start) / GC_page_size;
     {
       size_t page;
-      for (page = first; page < last; ++page) {
+      for (page = first; page < last;) {
         GC_coarse_page *state = &section->history[page];
-        GC_coarse_age_page(section, page);
+        if (protected) {
+          /* An unchanged permission needs no history update.  Skip
+             dense protected runs a bitmap byte at a time. */
+          if ((page & 7) == 0 && last - page >= 8
+              && section->protected_pages[page >> 3] == 0xff) {
+            page += 8;
+            continue;
+          }
+          if ((section->protected_pages[page >> 3]
+               & (1U << (page & 7))) != 0) {
+            ++page;
+            continue;
+          }
+        }
+        GC_coarse_age_page(section, page, gc_no);
         if (!protected) {
           /* Writable neighbours share a bounded grace period, without
              treating the exposure as an observed fault or increasing
@@ -3928,6 +3974,7 @@ GC_coarse_record_protection(ptr_t start, size_t len, GC_bool protected)
           state->protected_cycles = 0;
           state->probed = 1;
         }
+        ++page;
       }
     }
     while (first < last && (first & 7) != 0) {
@@ -5881,6 +5928,8 @@ GC_protect_range(ptr_t start, size_t len)
     GC_coarse_section *section = NULL;
     size_t dirty_word = 0;
     word dirty_mask = 0;
+    word gc_no = GC_gc_no;
+    GC_coarse_advance_age(gc_no);
     for (page = start; ADDR_LT(page, end); page += GC_page_size) {
       size_t index;
       if (section == NULL || ADDR_GE(page, section->end))
@@ -5888,6 +5937,7 @@ GC_protect_range(ptr_t start, size_t len)
       if (section == NULL)
         continue; /* Unknown pages use the normal protection path. */
       index = (size_t)(page - section->start) / GC_page_size;
+      GC_coarse_age_page(section, index, gc_no);
       if (section->history[index].delay == 0)
         continue;
       if (ADDR_LT(run, page))
@@ -5922,7 +5972,7 @@ GC_protect_heap(void)
 {
 #  ifdef GC_COARSE_MPROTECT
   if (!GC_manual_vdb && !IS_NON_MPROTECT_VDB()) {
-    GC_coarse_advance_age();
+    GC_coarse_advance_age(GC_gc_no);
     GC_coarse_sync_sections();
     GC_coarse_deferred_pages = 0;
   }
