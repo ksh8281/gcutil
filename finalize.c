@@ -128,7 +128,8 @@ GC_grow_table(struct hash_chain_entry ***table_ptr, unsigned *log_size_ptr,
    * the table grow.  Its capacity may grow before cleanup, but the metadata
    * allocations still count towards the ordinary collection budget.
    */
-  if (log_old_size >= (unsigned)GC_ON_GROW_LOG_SIZE_MIN && !GC_incremental
+  if (log_old_size >= (unsigned)GC_ON_GROW_LOG_SIZE_MIN
+      && !GC_incremental_collection
       && !GC_dont_gc && GC_should_collect()) {
     IF_CANCEL(int cancel_state;)
 
