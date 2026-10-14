@@ -3863,7 +3863,7 @@ GC_coarse_note_activity(ptr_t start, size_t bytes, GC_bool fault,
     limit = (size_t)(last - section->start) / GC_page_size;
     for (; page < limit; ++page) {
       GC_coarse_page *state = &section->history[page];
-      unsigned hold = 2;
+      unsigned hold = 16;
       GC_coarse_age_page(section, page);
       if (fault) {
         if (state->probed) {
@@ -3874,7 +3874,7 @@ GC_coarse_note_activity(ptr_t start, size_t bytes, GC_bool fault,
             state->backoff = 1;
           }
         }
-        hold = 1U << (state->backoff > 0 ? state->backoff : 1);
+        hold = 1U << (state->backoff > 3 ? state->backoff : 4);
       }
       if (state->delay < hold)
         state->delay = (unsigned char)hold;
