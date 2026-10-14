@@ -77,27 +77,25 @@ typedef pthread_mutex_t GC_isolate_mutex_t;
 #  endif
 
 /*
- * A single registry of disjoint address ranges covering exactly the
- * union of all heap sections any isolate has ever registered, each
- * tagged with whether it is currently committed (mprotect'd RW, i.e. a
- * live page some isolate can legitimately write to) or decommitted
- * (mprotect(PROT_NONE) + madvise(MADV_DONTNEED) by GC_unmap(), i.e. any
- * write there is a real bug). An address not covered by any range here
- * was never part of any isolate's heap at all.
+ * A sorted registry of the original, disjoint heap sections.  A bitmap
+ * records committed state per HBLKSIZE block; OS unmap/remap boundaries
+ * are multiples of HBLKSIZE.  Changing state never splits a registry
+ * entry or moves its tail.  An address outside these sections remains
+ * UNKNOWN, while a cleared bit identifies decommitted memory.
  *
  * GC_remap() is not guaranteed to be called with the exact same (start,
  * bytes) as the GC_unmap() that decommitted that memory -- blocks can
  * be split/merged in between (allchblk.c) -- so this is modeled as
  * proper interval state, not as a set of (un)commit events paired up by
  * matching address+length. GC_isolate_vdb_note_unmap()/_remap() mark an
- * arbitrary sub-range's committed state, splitting/merging existing
- * entries as needed, so a remap of different shape than the unmap that
+ * arbitrary block-aligned sub-range's committed state without changing
+ * section boundaries, so a remap of different shape than the unmap that
  * preceded it still lands on the correct final state everywhere.
  */
 typedef struct {
   ptr_t start;
   ptr_t end; /*< exclusive */
-  GC_bool committed;
+  unsigned char *committed;
 } GC_isolate_range;
 
 /* Marks a page dirty in the *calling* thread's own TLS bitmap, bypassing
@@ -214,152 +212,139 @@ first_pending_at_or_after(ptr_t address)
   return low;
 }
 
-/* Update only registered intervals; gaps keep their UNKNOWN classification.
-   Preserve address order during splitting so fault classification never
-   requires sorting.  Must be called with range_lock held. */
+/* Update only registered blocks; gaps keep their UNKNOWN classification.
+   Must be called with range_lock held.  Metadata is allocated only when
+   registering a section, never while changing committed state. */
 static void
 mark_range_locked(ptr_t start, ptr_t end, GC_bool committed)
 {
-  size_t first = first_range_ending_after(start);
-  size_t i, read, write;
+  size_t i = first_range_ending_after(start);
 
-  i = first;
-  while (i < range_count && range_registry[i].start < end) {
-    GC_isolate_range old = range_registry[i];
-    size_t left, right, extra;
-    if (old.committed == committed) {
-      ++i;
-      continue;
-    }
-    left = old.start < start ? 1 : 0;
-    right = old.end > end ? 1 : 0;
-    extra = left + right;
-    if (!ensure_range_capacity_locked(extra)) {
-      /* Losing tracking on allocation failure must yield UNKNOWN, never
-         classify a possibly decommitted address as a recoverable write. */
-      memmove(&range_registry[i], &range_registry[i + 1],
-              (range_count - i - 1) * sizeof(*range_registry));
-      --range_count;
-      continue;
-    }
-    if (extra != 0) {
-      memmove(&range_registry[i + 1 + extra], &range_registry[i + 1],
-              (range_count - i - 1) * sizeof(*range_registry));
-      range_count += extra;
-    }
-    if (left) {
-      range_registry[i] = old;
-      range_registry[i].end = start;
-    }
-    range_registry[i + left].start = left ? start : old.start;
-    range_registry[i + left].end = right ? end : old.end;
-    range_registry[i + left].committed = committed;
-    if (right) {
-      range_registry[i + left + 1] = old;
-      range_registry[i + left + 1].start = end;
-    }
-    i += 1 + extra;
-  }
+  for (; i < range_count && ADDR_LT(range_registry[i].start, end); ++i) {
+    GC_isolate_range *range = &range_registry[i];
+    ptr_t begin = ADDR_LT(start, range->start) ? range->start : start;
+    ptr_t stop = ADDR_LT(end, range->end) ? end : range->end;
+    size_t first = divHBLKSZ((size_t)(begin - range->start));
+    size_t last = divHBLKSZ((size_t)(stop - range->start));
 
-  /* Merge only the changed neighborhood, including its two boundaries.
-     Move the untouched tail once instead of sorting the whole registry
-     for every page-return/remap operation. */
-  read = first > 0 ? first - 1 : first;
-  write = read;
-  while (read < range_count && range_registry[read].start <= end) {
-    GC_isolate_range current = range_registry[read++];
-    if (write > 0 && range_registry[write - 1].end == current.start
-        && range_registry[write - 1].committed == current.committed) {
-      range_registry[write - 1].end = current.end;
-    } else {
-      range_registry[write++] = current;
+    GC_ASSERT((size_t)(begin - range->start) % HBLKSIZE == 0);
+    GC_ASSERT((size_t)(stop - range->start) % HBLKSIZE == 0);
+    while (first < last && (first & 7) != 0) {
+      unsigned char mask = (unsigned char)(1U << (first & 7));
+      if (committed)
+        range->committed[first >> 3] |= mask;
+      else
+        range->committed[first >> 3] &= (unsigned char)~mask;
+      ++first;
     }
-  }
-  if (write != read) {
-    memmove(&range_registry[write], &range_registry[read],
-            (range_count - read) * sizeof(*range_registry));
-    range_count -= read - write;
+    if (last - first >= 8) {
+      size_t bytes = (last - first) / 8;
+      memset(range->committed + (first >> 3), committed ? 0xff : 0, bytes);
+      first += bytes * 8;
+    }
+    while (first < last) {
+      unsigned char mask = (unsigned char)(1U << (first & 7));
+      if (committed)
+        range->committed[first >> 3] |= mask;
+      else
+        range->committed[first >> 3] &= (unsigned char)~mask;
+      ++first;
+    }
   }
 }
 
-/* Remove just the intersecting intervals, preserving both outside
-   remainders and the order of untouched entries. */
+/* Remove an original heap section at isolate deinitialization.  Sections
+   retain their registration boundaries even after arbitrary remaps. */
 static void
 delete_range_locked(ptr_t start, ptr_t end)
 {
-  size_t first = first_range_ending_after(start);
-  size_t last = first_range_starting_at_or_after(end);
-  size_t left, right, kept;
-  GC_isolate_range before, after;
+  size_t index = first_range_ending_after(start);
 
-  if (ADDR_GE(start, end) || first >= last)
+  if (index == range_count || ADDR_GE(range_registry[index].start, end))
     return;
-  before = range_registry[first];
-  after = range_registry[last - 1];
-  left = ADDR_LT(before.start, start) ? 1 : 0;
-  right = ADDR_LT(end, after.end) ? 1 : 0;
-  kept = left + right;
-  if (kept > last - first && !ensure_range_capacity_locked(1)) {
-    /* Allocation failure must lose coverage, not fabricate a committed
-       interval.  Keep the left remainder; the right becomes UNKNOWN. */
-    right = 0;
-    kept = left;
-  }
-  memmove(&range_registry[first + kept], &range_registry[last],
-          (range_count - last) * sizeof(*range_registry));
-  if (left) {
-    range_registry[first] = before;
-    range_registry[first].end = start;
-  }
-  if (right) {
-    range_registry[first + left] = after;
-    range_registry[first + left].start = end;
-  }
-  range_count = range_count - (last - first) + kept;
+  GC_ASSERT(range_registry[index].start == start);
+  GC_ASSERT(range_registry[index].end == end);
+  free(range_registry[index].committed);
+  memmove(&range_registry[index], &range_registry[index + 1],
+          (range_count - index - 1) * sizeof(*range_registry));
+  --range_count;
 }
 
 GC_INNER void
 GC_isolate_vdb_register_heap_sect(ptr_t start, size_t bytes)
 {
-  /* Register deferred incremental heaps from their first section too.
-     A VMA-limit fallback can later disable incremental mode; keep tracking
-     registered sections until deinitialization, including decommits and
-     remaps. */
+  /* Keep registered sections tracked even after a VMA-limit fallback
+     disables incremental mode.  Reserve their bitmap before publishing
+     the section, so allocation failure leaves its addresses UNKNOWN. */
   if (!GC_incremental && !GC_incremental_start_pending)
     return;
   GC_isolate_mutex_lock(&range_lock);
   {
     size_t index = first_range_starting_at_or_after(start);
+    size_t bitmap_bytes = (divHBLKSZ(bytes) + 7) / 8;
     ptr_t end = start + bytes;
+    unsigned char *committed;
+
+    GC_ASSERT(bytes % HBLKSIZE == 0);
     GC_ASSERT(index == 0 || ADDR_GE(start, range_registry[index - 1].end));
     GC_ASSERT(index == range_count || ADDR_GE(range_registry[index].start, end));
-    if (index > 0 && range_registry[index - 1].committed
-        && range_registry[index - 1].end == start) {
-      range_registry[index - 1].end = end;
-      if (index < range_count && range_registry[index].committed
-          && range_registry[index].start == end) {
-        range_registry[index - 1].end = range_registry[index].end;
-        memmove(&range_registry[index], &range_registry[index + 1],
-                (range_count - index - 1) * sizeof(*range_registry));
-        --range_count;
+    committed = (unsigned char *)malloc(bitmap_bytes);
+    if (committed != NULL) {
+      if (ensure_range_capacity_locked(1)) {
+        memset(committed, 0xff, bitmap_bytes);
+        memmove(&range_registry[index + 1], &range_registry[index],
+                (range_count - index) * sizeof(*range_registry));
+        range_registry[index].start = start;
+        range_registry[index].end = end;
+        range_registry[index].committed = committed;
+        ++range_count;
+        isolate_has_registered_ranges = TRUE;
+      } else {
+        free(committed);
       }
-      isolate_has_registered_ranges = TRUE;
-    } else if (index < range_count && range_registry[index].committed
-               && range_registry[index].start == end) {
-      range_registry[index].start = start;
-      isolate_has_registered_ranges = TRUE;
-    } else if (ensure_range_capacity_locked(1)) {
-      memmove(&range_registry[index + 1], &range_registry[index],
-              (range_count - index) * sizeof(*range_registry));
-      range_registry[index].start = start;
-      range_registry[index].end = end;
-      range_registry[index].committed = TRUE;
-      ++range_count;
-      isolate_has_registered_ranges = TRUE;
     }
-    /* On allocation failure, unrecorded addresses remain UNKNOWN. */
   }
   GC_isolate_mutex_unlock(&range_lock);
+}
+
+/* The caller holds range_lock and has checked the block is in range. */
+static GC_bool
+block_is_committed(const GC_isolate_range *range, size_t block)
+{
+  return (range->committed[block >> 3] & (1U << (block & 7))) != 0;
+}
+
+static size_t
+committed_begin(const GC_isolate_range *range, size_t block)
+{
+  while (block != 0) {
+    if ((block & 7) == 0 && range->committed[(block >> 3) - 1] == 0xff) {
+      block -= 8;
+    } else if (block_is_committed(range, block - 1)) {
+      --block;
+    } else {
+      break;
+    }
+  }
+  return block;
+}
+
+static size_t
+committed_end(const GC_isolate_range *range, size_t block)
+{
+  size_t blocks = divHBLKSZ((size_t)(range->end - range->start));
+
+  while (block < blocks) {
+    if ((block & 7) == 0 && blocks - block >= 8
+        && range->committed[block >> 3] == 0xff) {
+      block += 8;
+    } else if (block_is_committed(range, block)) {
+      ++block;
+    } else {
+      break;
+    }
+  }
+  return block;
 }
 
 GC_INNER void
@@ -398,8 +383,10 @@ GC_isolate_vdb_classify_fault(const void *addr)
     while (low < high) {
       size_t mid = low + (high - low) / 2;
       if (a >= range_registry[mid].start && a < range_registry[mid].end) {
-        result = range_registry[mid].committed ? GC_ISOLATE_VDB_CROSS_ISOLATE
-                                             : GC_ISOLATE_VDB_DECOMMITTED;
+        size_t block = divHBLKSZ((size_t)(a - range_registry[mid].start));
+        result = block_is_committed(&range_registry[mid], block)
+                     ? GC_ISOLATE_VDB_CROSS_ISOLATE
+                     : GC_ISOLATE_VDB_DECOMMITTED;
         break;
       } else if (a < range_registry[mid].start) {
         high = mid;
@@ -417,24 +404,35 @@ GC_isolate_vdb_committed_bounds(const void *addr, ptr_t *start, ptr_t *end)
 {
   ptr_t a = (ptr_t)addr;
   GC_bool found = FALSE;
-  size_t low = 0;
   size_t high;
 
   GC_isolate_mutex_lock(&range_lock);
-  high = range_count;
-  while (low < high) {
-    size_t mid = low + (high - low) / 2;
-    if (a < range_registry[mid].start) {
-      high = mid;
-    } else if (a >= range_registry[mid].end) {
-      low = mid + 1;
-    } else {
-      if (range_registry[mid].committed) {
-        *start = range_registry[mid].start;
-        *end = range_registry[mid].end;
-        found = TRUE;
+  high = first_range_ending_after(a);
+  if (high < range_count && ADDR_GE(a, range_registry[high].start)) {
+    size_t block = divHBLKSZ((size_t)(a - range_registry[high].start));
+    if (block_is_committed(&range_registry[high], block)) {
+      const GC_isolate_range *range = &range_registry[high];
+      size_t first = committed_begin(range, block);
+      size_t last = committed_end(range, block + 1);
+      size_t index = high;
+
+      *start = range->start + first * HBLKSIZE;
+      *end = range->start + last * HBLKSIZE;
+      while (first == 0 && index > 0
+             && range_registry[index - 1].end == *start) {
+        range = &range_registry[--index];
+        first = committed_begin(
+            range, divHBLKSZ((size_t)(range->end - range->start)));
+        *start = range->start + first * HBLKSIZE;
       }
-      break;
+      index = high;
+      while (*end == range_registry[index].end && index + 1 < range_count
+             && range_registry[index + 1].start == *end) {
+        range = &range_registry[++index];
+        last = committed_end(range, 0);
+        *end = range->start + last * HBLKSIZE;
+      }
+      found = TRUE;
     }
   }
   GC_isolate_mutex_unlock(&range_lock);
