@@ -399,7 +399,8 @@ min_bytes_allocd(void)
   GC_adaptive_root_scan_bytes = total_root_size;
   scan_size = 2 * GC_composite_in_use + GC_atomic_in_use / 4 + total_root_size;
   result = scan_size / GC_free_space_divisor;
-  if (GC_incremental) {
+  /* Keep the ordinary budget when measuring always-full GC. */
+  if (GC_incremental && GC_full_freq > 0) {
     result /= 2;
   }
   return result > min_bytes_allocd_minimum ? result : min_bytes_allocd_minimum;
@@ -1623,6 +1624,14 @@ GC_compute_heap_usage_percent(void)
  * Finish up a collection.  Assumes mark bits are consistent, but the
  * world is otherwise running.
  */
+STATIC MAY_THREAD_LOCAL word GC_benchmark_partial_gc_count;
+
+GC_API GC_word GC_CALL
+GC_get_benchmark_partial_gc_count(void)
+{
+  return GC_benchmark_partial_gc_count;
+}
+
 STATIC void
 GC_finish_collection(void)
 {
@@ -1781,6 +1790,8 @@ GC_finish_collection(void)
   /* Reset or increment counters for next cycle. */
   GC_n_attempts = 0;
   GC_adaptive_mark_debt = 0;
+  if (!GC_is_full_gc)
+    ++GC_benchmark_partial_gc_count;
   GC_is_full_gc = FALSE;
   GC_bytes_allocd_before_gc += GC_bytes_allocd;
   GC_non_gc_bytes_at_gc = GC_non_gc_bytes;
