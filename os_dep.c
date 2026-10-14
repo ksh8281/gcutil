@@ -5852,6 +5852,26 @@ GC_protect_range_inner(ptr_t start, size_t len)
 #  endif
 }
 
+#  ifdef GC_COARSE_MPROTECT
+/* Publish a union of deferred-page bits with the same concurrency rules
+   as single-page updates.  Other writers may add bits to this word. */
+STATIC void
+GC_coarse_publish_dirty_mask(size_t index, word mask)
+{
+#    if defined(THREADS) && defined(HAVE_LOCKFREE_AO_OR)
+  AO_or((volatile AO_t *)&GC_dirty_pages[index], (AO_t)mask);
+#    else
+#      if defined(THREADS) && defined(NEED_FAULT_HANDLER_LOCK)
+  GC_acquire_dirty_lock();
+#      endif
+  GC_dirty_pages[index] = GC_dirty_pages[index] | mask;
+#      if defined(THREADS) && defined(NEED_FAULT_HANDLER_LOCK)
+  GC_release_dirty_lock();
+#      endif
+#    endif
+}
+#  endif
+
 STATIC void
 GC_protect_range(ptr_t start, size_t len)
 {
@@ -5859,6 +5879,8 @@ GC_protect_range(ptr_t start, size_t len)
   if (GC_coarse_enabled && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()) {
     ptr_t page, run = start, end = start + len;
     GC_coarse_section *section = NULL;
+    size_t dirty_word = 0;
+    word dirty_mask = 0;
     for (page = start; ADDR_LT(page, end); page += GC_page_size) {
       size_t index;
       if (section == NULL || ADDR_GE(page, section->end))
@@ -5872,11 +5894,21 @@ GC_protect_range(ptr_t start, size_t len)
         GC_protect_range_inner(run, (size_t)(page - run));
       /* No writes can be observed while this page is writable.  Renew
          its dirty bit after every snapshot, including rescue passes. */
-      async_set_pht_entry_from_index(GC_dirty_pages,
-                                    PHT_HASH((struct hblk *)page));
+      {
+        size_t hash = PHT_HASH((struct hblk *)page);
+        size_t next_word = divWORDSZ(hash);
+        if (dirty_mask != 0 && next_word != dirty_word) {
+          GC_coarse_publish_dirty_mask(dirty_word, dirty_mask);
+          dirty_mask = 0;
+        }
+        dirty_word = next_word;
+        dirty_mask |= (word)1 << modWORDSZ(hash);
+      }
       ++GC_coarse_deferred_pages;
       run = page + GC_page_size;
     }
+    if (dirty_mask != 0)
+      GC_coarse_publish_dirty_mask(dirty_word, dirty_mask);
     if (ADDR_LT(run, end))
       GC_protect_range_inner(run, (size_t)(end - run));
     return;
