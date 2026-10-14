@@ -399,8 +399,7 @@ min_bytes_allocd(void)
   GC_adaptive_root_scan_bytes = total_root_size;
   scan_size = 2 * GC_composite_in_use + GC_atomic_in_use / 4 + total_root_size;
   result = scan_size / GC_free_space_divisor;
-  /* Keep the ordinary budget when measuring always-full GC. */
-  if (GC_incremental && GC_full_freq > 0) {
+  if (GC_incremental_collection) {
     result /= 2;
   }
   return result > min_bytes_allocd_minimum ? result : min_bytes_allocd_minimum;
@@ -768,7 +767,7 @@ GC_maybe_gc(void)
   if (!GC_should_collect())
     return;
 
-  if (!GC_incremental) {
+  if (!GC_incremental_collection) {
     GC_gcollect_inner();
     return;
   }
@@ -2355,7 +2354,7 @@ GC_collect_or_expand(word needed_blocks, unsigned flags, GC_bool retry)
     }
   }
 #endif
-  if (!GC_incremental && !GC_dont_gc
+  if (!GC_incremental_collection && !GC_dont_gc
       && ((GC_dont_expand && GC_bytes_allocd > 0)
           || (GC_fo_entries > last_fo_entries
               && (last_bytes_finalized | GC_bytes_finalized) != 0
@@ -2535,7 +2534,7 @@ GC_allocobj(size_t lg, int kind)
       break;
 
 #ifndef GC_DISABLE_INCREMENTAL
-    if (GC_incremental && GC_time_limit == GC_TIME_UNLIMITED && !tried_minor
+    if (GC_incremental_collection && GC_time_limit == GC_TIME_UNLIMITED && !tried_minor
         && !GC_dont_gc) {
       GC_collect_a_little_inner(1);
       tried_minor = TRUE;

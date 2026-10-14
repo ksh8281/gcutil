@@ -3971,6 +3971,12 @@ GC_INNER void GC_stackbase_info_update_after_fork(void);
 #  endif
 #endif /* CAN_HANDLE_FORK */
 
+/* Retain dirty-page tracking while using ordinary collection
+   scheduling for full marks without a marking deadline. */
+#define GC_incremental_collection \
+  (GC_incremental \
+   && (GC_full_freq != 0 || GC_time_limit != GC_TIME_UNLIMITED))
+
 #ifdef NO_MANUAL_VDB
 #  define GC_manual_vdb FALSE
 #  define GC_auto_incremental GC_incremental

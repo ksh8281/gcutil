@@ -3917,6 +3917,11 @@ GC_coarse_record_protection(ptr_t start, size_t len, GC_bool protected)
         GC_coarse_page *state = &section->history[page];
         GC_coarse_age_page(section, page);
         if (!protected) {
+          /* Writable neighbours share a bounded grace period, without
+             treating the exposure as an observed fault or increasing
+             their backoff.  Every deferred page remains dirty. */
+          if (state->delay < 16)
+            state->delay = 16;
           state->protected_cycles = state->probed = 0;
         } else if ((section->protected_pages[page >> 3]
                      & (1U << (page & 7))) == 0) {

@@ -69,7 +69,7 @@ GC_alloc_large(size_t lb_adjusted, int kind, unsigned flags, size_t align_m1)
   n_blocks = OBJ_SZ_TO_BLOCKS_CHECKED(SIZET_SAT_ADD(lb_adjusted, align_m1));
 
   /* Do our share of marking work. */
-  if (GC_incremental && !GC_dont_gc) {
+  if (GC_incremental_collection && !GC_dont_gc) {
     GC_collect_a_little_inner(n_blocks);
   }
 
