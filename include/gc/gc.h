@@ -364,6 +364,11 @@ GC_API GC_MAY_THREAD_LOCAL GC_ATTR_DEPRECATED int GC_use_entire_heap;
 GC_API GC_MAY_THREAD_LOCAL GC_ATTR_DEPRECATED int GC_full_freq;
 GC_API void GC_CALL GC_set_full_freq(int);
 GC_API int GC_CALL GC_get_full_freq(void);
+/**
+ * As GC_get_full_freq, including the supported GC_FULL_FREQUENCY
+ * environment override if initialization has not started.  Unsynchronized.
+ */
+GC_API int GC_CALL GC_get_full_freq_for_init(void);
 
 /**
  * Bytes not considered candidates for collection.  Used only to control
@@ -478,6 +483,12 @@ GC_API GC_MAY_THREAD_LOCAL GC_ATTR_DEPRECATED unsigned long GC_time_limit;
 #define GC_TIME_UNLIMITED 999999
 GC_API void GC_CALL GC_set_time_limit(unsigned long);
 GC_API unsigned long GC_CALL GC_get_time_limit(void);
+/**
+ * As GC_get_time_limit, including the supported GC_PAUSE_TIME_TARGET
+ * environment override if initialization has not started.  Unsynchronized.
+ * A build with NO_CLOCK or GC_DISABLE_INCREMENTAL ignores that override.
+ */
+GC_API unsigned long GC_CALL GC_get_time_limit_for_init(void);
 
 /** A portable type definition of time with a nanosecond precision. */
 struct GC_timeval_s {
@@ -599,6 +610,16 @@ GC_API size_t GC_CALL GC_get_min_bytes_allocd(void);
  */
 GC_API void GC_CALL GC_set_rate(int);
 GC_API int GC_CALL GC_get_rate(void);
+
+/**
+ * Enable allocation/dirty-page based incremental collection scheduling.
+ * This is opt-in and does not enable incremental mode itself.  The rate,
+ * time limit and retry count remain controlled by their existing setters.
+ * The time limit is also checked while doing incremental marking work;
+ * it remains a soft limit.  Not synchronized.
+ */
+GC_API void GC_CALL GC_set_adaptive_incremental(int);
+GC_API int GC_CALL GC_get_adaptive_incremental(void);
 
 /**
  * Set/get the maximum number of prior attempts at the world-stop marking.

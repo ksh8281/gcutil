@@ -339,6 +339,7 @@ GC_INNER MAY_THREAD_LOCAL word GC_total_stacksize = 0;
 
 /* The lowest value returned by `min_bytes_allocd()`. */
 static MAY_THREAD_LOCAL size_t min_bytes_allocd_minimum = 1;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_root_scan_bytes = 0;
 
 GC_API void GC_CALL
 GC_set_min_bytes_allocd(size_t value)
@@ -395,6 +396,7 @@ min_bytes_allocd(void)
   }
 
   total_root_size = 2 * stack_size + GC_root_size;
+  GC_adaptive_root_scan_bytes = total_root_size;
   scan_size = 2 * GC_composite_in_use + GC_atomic_in_use / 4 + total_root_size;
   result = scan_size / GC_free_space_divisor;
   if (GC_incremental) {
@@ -480,6 +482,107 @@ GC_start_incremental_collection(void)
 #endif
 }
 
+STATIC MAY_THREAD_LOCAL GC_bool GC_adaptive_incremental = FALSE;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_dirty_bytes = 0;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_hot_bytes = 0;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_marked_bytes = 0;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_marked_after_full = 0;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_retention_budget = 0;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_previous_dirty_bytes = 0;
+STATIC MAY_THREAD_LOCAL unsigned GC_adaptive_reclaim_rate = 0;
+STATIC MAY_THREAD_LOCAL unsigned GC_adaptive_previous_reclaim_rate = 0;
+STATIC MAY_THREAD_LOCAL GC_bool GC_adaptive_have_marked_bytes = FALSE;
+STATIC MAY_THREAD_LOCAL GC_bool GC_adaptive_batch_end = FALSE;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_budget = 0;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_sample_allocd = 0;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_sample_gc_no = 0;
+STATIC MAY_THREAD_LOCAL size_t GC_adaptive_mark_debt = 0;
+STATIC MAY_THREAD_LOCAL GC_bool GC_adaptive_expand_assist = FALSE;
+STATIC MAY_THREAD_LOCAL word GC_adaptive_last_expand_gc_no = 0;
+
+GC_API void GC_CALL
+GC_set_adaptive_incremental(int value)
+{
+  GC_adaptive_incremental = (GC_bool)(value != 0);
+  GC_adaptive_budget = 0;
+  GC_adaptive_mark_debt = 0;
+  GC_adaptive_have_marked_bytes = FALSE;
+  GC_adaptive_reclaim_rate = 0;
+  GC_adaptive_previous_reclaim_rate = 0;
+  GC_adaptive_previous_dirty_bytes = 0;
+  GC_adaptive_batch_end = FALSE;
+  GC_adaptive_marked_after_full = 0;
+  GC_adaptive_retention_budget = 0;
+}
+
+GC_API int GC_CALL
+GC_get_adaptive_incremental(void)
+{
+  return (int)GC_adaptive_incremental;
+}
+
+#ifndef GC_DISABLE_INCREMENTAL
+/* Reuse the bitmap without consuming it or re-protecting the heap. */
+STATIC word
+GC_adaptive_collection_budget(word normal_incremental_budget)
+{
+  word full_budget = normal_incremental_budget <= GC_WORD_MAX / 2
+                         ? normal_incremental_budget * 2 : GC_WORD_MAX;
+  word floor = normal_incremental_budget;
+  word used = GC_heapsize - GC_large_free_bytes;
+  word dirty;
+  word divisor = GC_free_space_divisor > 2
+                     ? GC_free_space_divisor - 2 : 1;
+  word budget;
+
+  GC_adaptive_retention_budget = normal_incremental_budget;
+
+  if (floor < (word)1024 * 1024)
+    floor = (word)1024 * 1024;
+  if (floor > full_budget)
+    floor = full_budget;
+  if (GC_adaptive_budget != 0 && GC_adaptive_sample_gc_no == GC_gc_no
+      && GC_bytes_allocd >= GC_adaptive_sample_allocd
+      && GC_bytes_allocd - GC_adaptive_sample_allocd < (word)256 * 1024)
+    return GC_adaptive_budget;
+  dirty = GC_current_dirty_bytes(&GC_adaptive_hot_bytes);
+  GC_adaptive_dirty_bytes = dirty;
+  /* Partial marks scan dirty old pages and newly allocated objects.  Keep
+     an allocation floor to amortize root scans and protection syscalls. */
+  budget = dirty <= (GC_WORD_MAX - GC_adaptive_root_scan_bytes) / 2
+               ? (2 * dirty + GC_adaptive_root_scan_bytes) / divisor
+               : full_budget;
+  if (dirty >= used / 3)
+    budget = full_budget;
+  if (budget < floor)
+    budget = floor;
+  if (budget > full_budget)
+    budget = full_budget;
+  /* Frequent writes alone do not justify more protection passes.  Assist
+   * repeated dirty pages only while recent partial marks recover enough
+   * newly allocated storage to pay for the shorter allocation interval.
+   */
+  if (GC_n_partial_gcs == GC_full_freq && dirty != 0
+      && GC_adaptive_hot_bytes >= dirty / 2
+      && GC_adaptive_reclaim_rate >= 5000
+      && GC_adaptive_previous_reclaim_rate >= 5000) {
+    word hot_floor = floor - floor / 4;
+
+    if (hot_floor < (word)1024 * 1024)
+      hot_floor = (word)1024 * 1024;
+    budget -= budget / 4;
+    if (budget < hot_floor)
+      budget = hot_floor;
+    if (budget > full_budget)
+      budget = full_budget;
+  }
+  GC_adaptive_budget = budget;
+  GC_adaptive_sample_allocd = GC_bytes_allocd;
+  GC_adaptive_sample_gc_no = GC_gc_no;
+  return budget;
+}
+#endif
+
 GC_INNER GC_bool
 GC_should_collect(void)
 {
@@ -504,6 +607,15 @@ GC_should_collect(void)
     return TRUE;
   }
 
+#ifndef GC_DISABLE_INCREMENTAL
+  if (GC_incremental && GC_adaptive_incremental) {
+    word allocated = GC_adj_bytes_allocd();
+    /* Avoid reading the bitmap for allocations below any policy budget. */
+    if (allocated < last_min_bytes_allocd)
+      return FALSE;
+    return allocated >= GC_adaptive_collection_budget(last_min_bytes_allocd);
+  }
+#endif
   return GC_adj_bytes_allocd() >= last_min_bytes_allocd;
 }
 
@@ -614,6 +726,33 @@ GC_notify_full_gc(void)
 STATIC GC_bool GC_stopped_mark(GC_stop_func stop_func);
 STATIC void GC_finish_collection(void);
 
+/* Defer only the periodic full mark.  Allocation/protection requests and
+ * the dirty limit keep their existing meaning.  Retained old objects are
+ * not reclaimed by a partial mark, so cap both growth and extra cycles.
+ */
+STATIC GC_bool
+GC_adaptive_defer_periodic_full(void)
+{
+  word used = GC_heapsize - GC_large_free_bytes;
+  word growth = used > GC_used_heap_size_after_full
+                    ? used - GC_used_heap_size_after_full : 0;
+  word growth_limit = GC_used_heap_size_after_full / 8;
+  word marked_growth = GC_adaptive_marked_bytes > GC_adaptive_marked_after_full
+                           ? GC_adaptive_marked_bytes
+                                 - GC_adaptive_marked_after_full : 0;
+  int extra_limit = GC_full_freq > 1 ? GC_full_freq / 2 : 1;
+
+  if (growth_limit < (word)4 * 1024 * 1024)
+    growth_limit = (word)4 * 1024 * 1024;
+  return GC_adaptive_incremental && GC_full_freq > 0
+         && GC_n_partial_gcs - GC_full_freq < extra_limit
+         && GC_adaptive_reclaim_rate >= 5000
+         && GC_adaptive_previous_reclaim_rate >= 5000
+         && growth <= growth_limit
+         && GC_adaptive_retention_budget != 0
+         && marked_growth <= GC_adaptive_retention_budget;
+}
+
 /*
  * Initiate a garbage collection if appropriate.  Choose judiciously
  * between partial, full, and stop-world collections.
@@ -621,6 +760,8 @@ STATIC void GC_finish_collection(void);
 STATIC void
 GC_maybe_gc(void)
 {
+  GC_bool periodic_full;
+
   GC_ASSERT(I_HOLD_LOCK());
   ASSERT_CANCEL_DISABLED();
   if (!GC_should_collect())
@@ -636,7 +777,61 @@ GC_maybe_gc(void)
   if (GC_parallel)
     GC_wait_for_reclaim();
 #endif
-  if (GC_need_full_gc || GC_n_partial_gcs >= GC_full_freq) {
+#ifndef GC_DISABLE_INCREMENTAL
+  if (GC_adaptive_incremental) {
+    word used = GC_heapsize - GC_large_free_bytes;
+    unsigned ratio;
+
+    /* Forced allocation-pressure collections can bypass the budget
+     * sampler.  Refresh their activity hints before making a decision.
+     */
+    GC_adaptive_budget = 0;
+    (void)GC_adaptive_collection_budget(min_bytes_allocd());
+    if (GC_adaptive_batch_end
+        && GC_adaptive_dirty_bytes > GC_adaptive_previous_dirty_bytes)
+      GC_adaptive_batch_end = FALSE;
+    ratio = used != 0
+                         ? (unsigned)((double)GC_adaptive_dirty_bytes * 10000 / (double)used)
+                         : 0;
+    GC_COND_LOG_PRINTF("Adaptive incremental: allocated %lu, used %lu, dirty-estimate %lu, budget %lu, dirty-ratio %u.%02u%%\n",
+                       (unsigned long)GC_adj_bytes_allocd(),
+                       (unsigned long)(GC_heapsize - GC_large_free_bytes),
+                       (unsigned long)GC_adaptive_dirty_bytes,
+                       (unsigned long)GC_adaptive_budget, ratio / 100, ratio % 100);
+  }
+#endif
+  periodic_full = GC_n_partial_gcs >= GC_full_freq;
+  if (periodic_full && !GC_need_full_gc && !GC_adaptive_batch_end
+      && GC_adaptive_defer_periodic_full()) {
+    periodic_full = FALSE;
+    GC_COND_LOG_PRINTF("Adaptive periodic full deferred: partial-count %d, reclaim-rate %u, previous-rate %u, hot-estimate %lu, marked %lu, full-marked %lu, retention-budget %lu\n",
+                       GC_n_partial_gcs, GC_adaptive_reclaim_rate,
+                       GC_adaptive_previous_reclaim_rate,
+                       (unsigned long)GC_adaptive_hot_bytes,
+                       (unsigned long)GC_adaptive_marked_bytes,
+                       (unsigned long)GC_adaptive_marked_after_full,
+                       (unsigned long)GC_adaptive_retention_budget);
+  }
+  if (GC_need_full_gc || periodic_full
+      || (GC_adaptive_incremental && GC_adaptive_batch_end
+          && GC_n_partial_gcs >= 2)
+#ifndef GC_DISABLE_INCREMENTAL
+      || (GC_adaptive_incremental
+          && GC_adaptive_dirty_bytes >= (GC_heapsize - GC_large_free_bytes) / 3)
+#endif
+  ) {
+    if (GC_adaptive_incremental) {
+      GC_COND_LOG_PRINTF(
+          "Adaptive full-mark reasons: need-full %d, partial-count %d, partial-limit %d, dirty-estimate %lu, used %lu\n",
+          (int)GC_need_full_gc, GC_n_partial_gcs, GC_full_freq,
+          (unsigned long)GC_adaptive_dirty_bytes,
+          (unsigned long)(GC_heapsize - GC_large_free_bytes));
+      GC_COND_LOG_PRINTF("Adaptive full policy: periodic %d, batch-end %d, reclaim-rate %u, previous-rate %u, hot-estimate %lu\n",
+                         (int)periodic_full, (int)GC_adaptive_batch_end,
+                         GC_adaptive_reclaim_rate,
+                         GC_adaptive_previous_reclaim_rate,
+                         (unsigned long)GC_adaptive_hot_bytes);
+    }
     GC_COND_LOG_PRINTF(
         "***>Full mark for collection #%lu after %lu bytes allocated\n",
         (unsigned long)GC_gc_no + 1, (unsigned long)GC_bytes_allocd);
@@ -854,6 +1049,12 @@ GC_INNER void
 GC_collect_a_little_inner(size_t n_blocks)
 {
   IF_CANCEL(int cancel_state;)
+#ifndef NO_CLOCK
+  CLOCK_TYPE work_start = CLOCK_TYPE_INITIALIZER;
+  GC_bool work_timed = GC_PRINT_STATS_FLAG;
+  if (work_timed)
+    GET_TIME(work_start);
+#endif
 
   GC_ASSERT(I_HOLD_LOCK());
   GC_ASSERT(GC_is_initialized);
@@ -861,13 +1062,36 @@ GC_collect_a_little_inner(size_t n_blocks)
   if (GC_incremental && GC_collection_in_progress()) {
     size_t i;
     size_t max_deficit = GC_rate * n_blocks;
+    if (GC_adaptive_incremental) {
+      size_t requested = n_blocks > GC_WORD_MAX / GC_rate
+                             ? GC_WORD_MAX : GC_rate * n_blocks;
+      max_deficit = GC_adaptive_mark_debt > GC_WORD_MAX - requested
+                        ? GC_WORD_MAX : requested + GC_adaptive_mark_debt;
+    }
 
     ENTER_GC();
 #ifdef PARALLEL_MARK
     if (GC_time_limit != GC_TIME_UNLIMITED)
       GC_parallel_mark_disabled = TRUE;
 #endif
+#ifndef NO_CLOCK
+    if (GC_adaptive_incremental && GC_time_limit != GC_TIME_UNLIMITED)
+      GET_TIME(GC_start_time);
+#endif
     for (i = GC_mark_deficit; i < max_deficit; i++) {
+#ifndef NO_CLOCK
+      if (GC_adaptive_incremental && GC_time_limit != GC_TIME_UNLIMITED
+          && ((i - GC_mark_deficit) & 3) == 0) {
+        CLOCK_TYPE now;
+        unsigned long elapsed, nsec;
+        GET_TIME(now);
+        elapsed = MS_TIME_DIFF(now, GC_start_time);
+        nsec = NS_FRAC_TIME_DIFF(now, GC_start_time);
+        if (elapsed > GC_time_limit
+            || (elapsed == GC_time_limit && nsec >= GC_time_lim_nsec))
+          break;
+      }
+#endif
       if (GC_mark_some(NULL))
         break;
     }
@@ -876,7 +1100,7 @@ GC_collect_a_little_inner(size_t n_blocks)
 #endif
     EXIT_GC();
 
-    if (i < max_deficit && !GC_dont_gc) {
+    if (i < max_deficit && !GC_collection_in_progress() && !GC_dont_gc) {
       GC_ASSERT(!GC_collection_in_progress());
       /* Need to follow up with a full collection. */
       SAVE_CALLERS_TO_LAST_STACK();
@@ -897,13 +1121,40 @@ GC_collect_a_little_inner(size_t n_blocks)
         GC_n_attempts++;
       }
     }
+    if (GC_adaptive_incremental) {
+      /* A timed assist may stop before paying the allocation's work
+         quota.  Preserve that unpaid work for the next assist; dropping
+         it lets large allocations outrun a full incremental mark.  i
+         includes the existing prepaid GC_mark_deficit credit. */
+      GC_adaptive_mark_debt = GC_collection_in_progress() && i < max_deficit
+                                  ? max_deficit - i : 0;
+    }
     if (GC_mark_deficit > 0) {
       GC_mark_deficit
           = GC_mark_deficit > max_deficit ? GC_mark_deficit - max_deficit : 0;
     }
   } else if (!GC_dont_gc) {
     GC_maybe_gc();
+    if (GC_adaptive_incremental && GC_incremental
+        && GC_collection_in_progress()) {
+      /* The call starting a collection also represents an allocation
+         quota, which can be much larger than one heap block. */
+      GC_adaptive_mark_debt = n_blocks > GC_WORD_MAX / GC_rate
+                                 ? GC_WORD_MAX : GC_rate * n_blocks;
+    }
   }
+#ifndef NO_CLOCK
+  if (work_timed) {
+    CLOCK_TYPE work_end;
+    unsigned long elapsed;
+    GET_TIME(work_end);
+    elapsed = MS_TIME_DIFF(work_end, work_start);
+    if (elapsed > 0)
+      GC_COND_LOG_PRINTF("GC allocation work step took %lu ms %lu ns (incremental %d, mark-debt %lu)\n",
+                         elapsed, NS_FRAC_TIME_DIFF(work_end, work_start),
+                         (int)GC_incremental, (unsigned long)GC_adaptive_mark_debt);
+  }
+#endif
   RESTORE_CANCEL(cancel_state);
 }
 
@@ -1441,6 +1692,48 @@ GC_finish_collection(void)
   /* Reconstruct free lists to contain everything not marked. */
   GC_start_reclaim(FALSE);
 
+  if (GC_adaptive_incremental) {
+    word marked = GC_composite_in_use + GC_atomic_in_use;
+    word expected = GC_adaptive_marked_bytes <= GC_WORD_MAX - GC_bytes_allocd
+                        ? GC_adaptive_marked_bytes + GC_bytes_allocd
+                        : GC_WORD_MAX;
+    word recovered = GC_adaptive_have_marked_bytes && expected > marked
+                         ? expected - marked : 0;
+    unsigned rate = GC_bytes_allocd != 0
+                        ? (recovered >= GC_bytes_allocd
+                               ? 10000
+                               : (unsigned)((double)recovered * 10000
+                                            / (double)GC_bytes_allocd))
+                        : 0;
+
+    /* Marked occupancy is computed by the existing reclaim traversal.
+     * The difference estimates newly reclaimable storage, including lazy
+     * sweep candidates; it is not an RSS decrease or a completed sweep.
+     * A yield spike plus sharply quieter writes is a batch-end hint.
+     */
+    GC_adaptive_batch_end = !GC_is_full_gc && GC_bytes_allocd >= 1024 * 1024
+                           && (rate >= 9500
+                               || (rate >= 7500
+                                   && GC_adaptive_reclaim_rate <= rate / 2))
+                           && GC_adaptive_previous_dirty_bytes != 0
+                           && GC_adaptive_dirty_bytes
+                                  <= GC_adaptive_previous_dirty_bytes / 2;
+    GC_adaptive_previous_reclaim_rate = GC_is_full_gc
+                                           ? 0 : GC_adaptive_reclaim_rate;
+    GC_adaptive_reclaim_rate = GC_is_full_gc ? 0 : rate;
+    GC_adaptive_previous_dirty_bytes = GC_adaptive_dirty_bytes;
+    GC_adaptive_marked_bytes = marked;
+    GC_adaptive_have_marked_bytes = TRUE;
+    if (GC_is_full_gc)
+      GC_adaptive_marked_after_full = marked;
+    GC_COND_LOG_PRINTF("Adaptive reclaim estimate: full %d, allocated %lu, marked %lu, recovered %lu, rate %u, dirty-estimate %lu, hot-estimate %lu, batch-end %d\n",
+                       (int)GC_is_full_gc, (unsigned long)GC_bytes_allocd,
+                       (unsigned long)marked, (unsigned long)recovered, rate,
+                       (unsigned long)GC_adaptive_dirty_bytes,
+                       (unsigned long)GC_adaptive_hot_bytes,
+                       (int)GC_adaptive_batch_end);
+  }
+
 #ifdef USE_MUNMAP
   if (GC_unmap_threshold > 0    /*< memory unmapping enabled? */
       && LIKELY(GC_gc_no != 1)) { /*< do not unmap during `GC_init` */
@@ -1474,6 +1767,12 @@ GC_finish_collection(void)
   if (GC_is_full_gc) {
     GC_used_heap_size_after_full = GC_heapsize - GC_large_free_bytes;
     GC_need_full_gc = FALSE;
+  } else if (GC_adaptive_incremental) {
+    /* Partial marks retain old marks, including objects that have died.
+       Their apparent growth is not evidence that a full mark is needed.
+       Reuse the resulting reclaim lists before advancing the next mark;
+       the partial-count and dirty limits still bound retained garbage.
+       Preserve requests made by actual allocation or protection pressure. */
   } else {
     GC_need_full_gc = GC_heapsize - GC_used_heap_size_after_full
                       > min_bytes_allocd() + GC_large_free_bytes;
@@ -1481,6 +1780,7 @@ GC_finish_collection(void)
 
   /* Reset or increment counters for next cycle. */
   GC_n_attempts = 0;
+  GC_adaptive_mark_debt = 0;
   GC_is_full_gc = FALSE;
   GC_bytes_allocd_before_gc += GC_bytes_allocd;
   GC_non_gc_bytes_at_gc = GC_non_gc_bytes;
@@ -1489,6 +1789,25 @@ GC_finish_collection(void)
   GC_bytes_freed = 0;
   GC_finalizer_bytes_freed = 0;
 
+#if !defined(GC_DISABLE_INCREMENTAL) && defined(MPROTECT_VDB)
+  if (GC_incremental_start_pending
+      && GC_used_heap_size_after_full >= GC_incremental_start_threshold) {
+    /* All reachable objects were traced by this ordinary full collection.
+       Start dirty tracking before allowing subsequent partial collections;
+       the first protection pass covers every pointer-bearing heap range. */
+    GC_incremental_start_pending = FALSE;
+    GC_incremental = TRUE;
+    GC_handle_protected_regions_limit();
+    if (GC_incremental) {
+      GC_read_dirty(TRUE);
+      if (GC_incremental)
+        GC_COND_LOG_PRINTF("Incremental mprotect activated after full collection #%lu: occupied heap %lu bytes, threshold %lu bytes\n",
+                           (unsigned long)GC_gc_no,
+                           (unsigned long)GC_used_heap_size_after_full,
+                           (unsigned long)GC_incremental_start_threshold);
+    }
+  }
+#endif
   if (GC_on_collection_event)
     GC_on_collection_event(GC_EVENT_RECLAIM_END);
 #ifndef NO_CLOCK
@@ -1985,6 +2304,46 @@ GC_collect_or_expand(word needed_blocks, unsigned flags, GC_bool retry)
   GC_ASSERT(I_HOLD_LOCK());
   GC_ASSERT(GC_is_initialized);
   DISABLE_CANCEL(cancel_state);
+#ifndef GC_DISABLE_INCREMENTAL
+  if (GC_incremental && GC_adaptive_incremental && !GC_dont_gc
+      && !GC_disable_automatic_collection && !GC_adaptive_expand_assist) {
+    word before = GC_gc_no;
+    word used = GC_heapsize - GC_large_free_bytes;
+    word budget = min_bytes_allocd();
+    word growth = used > GC_used_heap_size_after_full
+                      ? used - GC_used_heap_size_after_full : 0;
+    GC_bool full_request = !GC_collection_in_progress()
+                           && (retry
+                               || GC_gc_no != GC_adaptive_last_expand_gc_no)
+                           && GC_n_partial_gcs > 0 && growth > budget
+                           && growth - budget > budget;
+
+    /* No suitable block survived the allocator's size-specific reclaim
+       attempt.  Give a partial collection a bounded chance to finish
+       before growing the heap.  A failed retry, or exhausted reclaim
+       following a collection since the last expansion, may ask for a
+       full mark with twice the incremental growth budget.
+       Finalization can allocate recursively while finishing a mark. */
+    if (full_request)
+      GC_need_full_gc = TRUE;
+    if (!GC_collection_in_progress()
+        && (GC_bytes_allocd != 0 || full_request))
+      GC_should_start_incremental_collection = TRUE;
+    GC_COND_LOG_PRINTF(
+        "Adaptive allocation pressure: requested-blocks %lu, retry %d, full-request %d, growth %lu, budget %lu\n",
+        (unsigned long)needed_blocks, (int)retry, (int)full_request,
+        (unsigned long)growth, (unsigned long)budget);
+    GC_adaptive_expand_assist = TRUE;
+    GC_collect_a_little_inner(needed_blocks);
+    GC_adaptive_expand_assist = FALSE;
+    GC_adaptive_last_expand_gc_no = GC_gc_no;
+    if (GC_gc_no != before) {
+      /* Retry the allocation against the newly completed reclaim lists. */
+      RESTORE_CANCEL(cancel_state);
+      return TRUE;
+    }
+  }
+#endif
   if (!GC_incremental && !GC_dont_gc
       && ((GC_dont_expand && GC_bytes_allocd > 0)
           || (GC_fo_entries > last_fo_entries
@@ -2128,6 +2487,17 @@ GC_allocobj(size_t lg, int kind)
 #endif
 
 #ifndef GC_DISABLE_INCREMENTAL
+    if (GC_incremental && GC_adaptive_incremental) {
+      GC_ASSERT(!GC_is_full_gc || NULL == GC_obj_kinds[kind].ok_reclaim_list
+                || NULL == GC_obj_kinds[kind].ok_reclaim_list[lg]);
+      /* Satisfy this size class from completed collection work before
+         doing more marking or requesting another heap block. */
+      GC_continue_reclaim(lg, kind);
+      /* Keep paying the normal marking quota while a mark is active.
+         Reusing a reclaimed block still supplies allocation work. */
+      if (*flh != NULL && !GC_collection_in_progress())
+        break;
+    }
     if (GC_incremental && GC_time_limit != GC_TIME_UNLIMITED && !GC_dont_gc) {
       /*
        * True incremental mode, not just generational.

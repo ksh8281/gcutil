@@ -2062,6 +2062,7 @@ struct _GC_arrays {
 
 #ifdef GC_DISABLE_INCREMENTAL
 #  define GC_incremental FALSE
+#  define GC_incremental_start_pending FALSE
 #else
   /*
    * Using incremental/generational collection.  Assumes dirty bits are
@@ -2069,6 +2070,14 @@ struct _GC_arrays {
    */
 #  define GC_incremental GC_arrays._incremental
   GC_bool _incremental;
+
+  /* Preserve VDB initialization and section registration while collecting
+     small heaps without page protection.  Activation is one-way and only
+     follows a completed full mark. */
+#  define GC_incremental_start_pending GC_arrays._incremental_start_pending
+  GC_bool _incremental_start_pending;
+#  define GC_incremental_start_threshold GC_arrays._incremental_start_threshold
+  word _incremental_start_threshold;
 
 #  define GC_should_start_incremental_collection \
     GC_arrays._should_start_incremental_collection
@@ -3993,6 +4002,12 @@ GC_API_PATCHABLE void GC_dirty_inner(const void *p);
  */
 GC_INNER GC_bool GC_dirty_init(void);
 
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+GC_INNER void GC_coarse_protection_deinit(void);
+GC_INNER void GC_coarse_note_rw_remap(ptr_t start, size_t bytes);
+GC_INNER void GC_coarse_note_foreign_write(ptr_t start, size_t bytes);
+#endif
+
 #  ifdef UFFDWP_VDB
 /*
  * Release whatever `GC_dirty_init()` allocated for the calling thread
@@ -4019,6 +4034,8 @@ GC_INNER void GC_dirty_deinit(void);
  * `output_unneeded` is `TRUE` at least if the multi-threading support is on).
  */
 GC_INNER void GC_read_dirty(GC_bool output_unneeded);
+/* Non-destructive estimate from the current dirty-page hash bitmap. */
+GC_INNER word GC_current_dirty_bytes(word *hot_bytes);
 
 /*
  * Is the `HBLKSIZE`-sized page at `h` marked dirty in the local buffer?
