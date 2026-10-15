@@ -412,6 +412,10 @@ setup_header(hdr *hhdr, struct hblk *block, size_t lb_adjusted, int kind,
       hhdr->hb_descr = 0;
       hhdr->hb_flags |= LARGE_BLOCK;
       hhdr->hb_map = NULL;
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+    && !defined(GC_DISABLE_INCREMENTAL)
+      GC_coarse_invalidate_eligibility();
+#endif
       return FALSE;
     }
 #  ifdef LINT2
@@ -426,6 +430,12 @@ setup_header(hdr *hhdr, struct hblk *block, size_t lb_adjusted, int kind,
   GC_clear_hdr_marks(hhdr);
 
   hhdr->hb_last_reclaimed = (unsigned short)GC_gc_no;
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+    && !defined(GC_DISABLE_INCREMENTAL)
+  GC_coarse_note_eligibility((ptr_t)block,
+                              OBJ_SZ_TO_BLOCKS(lb_adjusted) * HBLKSIZE,
+                              !IS_PTRFREE(hhdr));
+#endif
   return TRUE;
 }
 
@@ -1402,6 +1412,10 @@ GC_freehblk(struct hblk *hbp)
 
   GC_ASSERT(IS_MAPPED(hhdr));
   hhdr->hb_flags |= FREE_BLK;
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+    && !defined(GC_DISABLE_INCREMENTAL)
+  GC_coarse_note_eligibility((ptr_t)hbp, size, TRUE);
+#endif
   next = (struct hblk *)((ptr_t)hbp + size);
   GET_HDR(next, nexthdr);
   prev = GC_free_block_ending_at(hbp);

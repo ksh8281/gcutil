@@ -90,6 +90,12 @@
 /* For output, locking, some statistics and `gcconfig.h` file. */
 #define NOT_GCBUILD
 #include "private/gc_priv.h"
+#if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+#  include "private/vdb_isolate.h"
+#  if defined(LINUX)
+#    include <pthread.h>
+#  endif
+#endif
 
 #ifdef TEST_NO_THREADS
 #  undef THREADS
@@ -1644,6 +1650,223 @@ test_full_collection_tracking(void)
   GC_printf("Tested full collections with dirty tracking enabled\n");
 }
 
+static GC_bool
+is_test_page_writable(const volatile unsigned char *page)
+{
+  FILE *maps = fopen("/proc/self/maps", "r");
+  char line[512], permissions[5];
+  unsigned long first, last;
+  GC_bool found = FALSE, writable = FALSE;
+
+  TEST_ASSERT(maps != NULL);
+  while (fgets(line, sizeof(line), maps) != NULL) {
+    if (sscanf(line, "%lx-%lx %4s", &first, &last, permissions) == 3
+        && (GC_uintptr_t)page >= first && (GC_uintptr_t)page < last) {
+      found = TRUE;
+      writable = permissions[1] == 'w';
+      break;
+    }
+  }
+  fclose(maps);
+  TEST_ASSERT(found);
+  return writable;
+}
+
+static unsigned
+test_write_and_wait_for_protection(volatile unsigned char *page)
+{
+  unsigned count;
+
+  TEST_ASSERT(!is_test_page_writable(page));
+  *page = (unsigned char)(*page + 1);
+  TEST_ASSERT(is_test_page_writable(page));
+  for (count = 0; count <= 33; ++count) {
+    GC_gcollect();
+    if (!is_test_page_writable(page))
+      return count;
+  }
+  TEST_ASSERT(FALSE);
+  return 0;
+}
+
+/* Observe real permissions while repeated writes increase the grace
+   period.  The owning base remains in a volatile stack slot throughout;
+   the derived probe address is not needed to keep the allocation alive. */
+static void
+test_isolate_mprotect_aging(void)
+{
+  const size_t offsets[] = { 0, 1, 31, 32, 33, 63, 64, 65,
+                             127, 128, 129, 255, 256, 510 };
+  void *volatile allocation;
+  volatile unsigned char *page;
+  unsigned count, first_grace, round;
+  unsigned long saved_time = GC_get_time_limit();
+  int saved_frequency = GC_get_full_freq();
+
+  if (GC_get_actual_vdb() != GC_VDB_MPROTECT || GC_page_size != HBLKSIZE)
+    return;
+  GC_set_time_limit(GC_TIME_UNLIMITED);
+  GC_set_full_freq(0);
+  allocation = GC_malloc(2 * 1024 * 1024);
+  TEST_ASSERT(allocation != NULL);
+  page = (volatile unsigned char *)PTR_ALIGN_UP(
+      (ptr_t)allocation + 128 * HBLKSIZE, GC_page_size);
+  for (count = 0; count <= 33 && is_test_page_writable(page); ++count)
+    GC_gcollect();
+  TEST_ASSERT(!is_test_page_writable(page));
+  first_grace = test_write_and_wait_for_protection(page);
+  TEST_ASSERT(first_grace >= 2 && first_grace <= 16
+              && (first_grace & (first_grace - 1)) == 0);
+  for (round = 2; round <= 5; ++round) {
+    unsigned expected = 1U << round;
+    if (expected < first_grace)
+      expected = first_grace;
+    TEST_ASSERT(test_write_and_wait_for_protection(page) == expected);
+  }
+  GC_gcollect();
+  GC_gcollect();
+  TEST_ASSERT(test_write_and_wait_for_protection(page) == first_grace);
+  /* Exercise partial words and both 32- and 64-bit bitmap boundaries.
+     Each probe must fault and become protected again after its grace. */
+  for (round = 0; round < sizeof(offsets) / sizeof(offsets[0]); ++round) {
+    page = (volatile unsigned char *)PTR_ALIGN_UP((ptr_t)allocation,
+                                                 GC_page_size)
+           + offsets[round] * GC_page_size;
+    TEST_ASSERT(test_write_and_wait_for_protection(page) <= 32);
+  }
+  /* One hint spans several bitmap words, unlike the single-page faults. */
+  page = (volatile unsigned char *)PTR_ALIGN_UP((ptr_t)allocation,
+                                               GC_page_size)
+         + 31 * GC_page_size;
+  GC_remove_protection((struct hblk *)page, 67, FALSE);
+  for (round = 0; round < 67; ++round)
+    page[round * GC_page_size] = (unsigned char)round;
+  for (count = 0; count <= 33; ++count) {
+    GC_gcollect();
+    if (!is_test_page_writable(page)
+        && !is_test_page_writable(page + 66 * GC_page_size))
+      break;
+  }
+  TEST_ASSERT(count <= 33);
+  for (round = 0; round < 67; ++round) {
+    TEST_ASSERT(!is_test_page_writable(page + round * GC_page_size));
+    TEST_ASSERT(page[round * GC_page_size] == (unsigned char)round);
+  }
+  GC_free((void *)allocation);
+  allocation = NULL;
+  GC_set_full_freq(saved_frequency);
+  GC_set_time_limit(saved_time);
+  GC_printf("Tested isolate mprotect grace growth and cold-page reset\n");
+}
+
+/* Alternate atomic and pointer-containing allocations in reused blocks,
+   force free-page unmapping and heap growth, and check live data after GC.
+   Debug builds compare every protection pass with the original
+   header walk, including newly added sections. */
+static void
+test_isolate_protection_eligibility(void)
+{
+  void *volatile objects[32] = { NULL };
+  size_t lengths[32] = { 0 };
+  unsigned char values[32] = { 0 };
+  const size_t blocks[] = { 1, 3, 17, 65, 2 };
+  unsigned round, slot;
+
+  if (GC_get_actual_vdb() != GC_VDB_MPROTECT || GC_page_size != HBLKSIZE)
+    return;
+  for (round = 0; round < 24; ++round) {
+    if (round % 8 == 0)
+      TEST_ASSERT(GC_expand_hp(2 * 1024 * 1024));
+    for (slot = 0; slot < 32; ++slot) {
+      if ((slot + round) % 3 != 0)
+        continue;
+      if (objects[slot] != NULL) {
+        GC_free((void *)objects[slot]);
+        objects[slot] = NULL;
+      }
+      lengths[slot] = blocks[(slot + round) % 5] * HBLKSIZE - 2 * GC_GRANULE_BYTES;
+      objects[slot] = (slot + round) % 2 == 0
+                          ? GC_malloc(lengths[slot])
+                          : GC_malloc_atomic(lengths[slot]);
+      TEST_ASSERT(objects[slot] != NULL);
+      values[slot] = (unsigned char)(slot + round + 1);
+      ((unsigned char *)objects[slot])[0] = values[slot];
+      ((unsigned char *)objects[slot])[lengths[slot] - 1] = values[slot];
+    }
+    if (round % 3 == 0)
+      GC_gcollect_and_unmap();
+    else
+      GC_gcollect();
+    for (slot = 0; slot < 32; ++slot) {
+      if (objects[slot] != NULL) {
+        TEST_ASSERT(((unsigned char *)objects[slot])[0] == values[slot]);
+        TEST_ASSERT(((unsigned char *)objects[slot])[lengths[slot] - 1]
+                    == values[slot]);
+      }
+    }
+  }
+  for (slot = 0; slot < 32; ++slot) {
+    if (objects[slot] != NULL) {
+      GC_free((void *)objects[slot]);
+      objects[slot] = NULL;
+    }
+  }
+  GC_gcollect_and_unmap();
+  GC_gcollect();
+  GC_printf("Tested protection eligibility updates across allocation and unmapping\n");
+}
+
+static void *
+test_foreign_page_write(void *argument)
+{
+  volatile unsigned char *page = (volatile unsigned char *)argument;
+  *page = (unsigned char)(*page + 1);
+  return NULL;
+}
+
+/* A plain thread has no local GC instance.  Its fault must publish the
+   foreign-write flag before recovery exposes the owner's page, and the
+   owner must subsequently restore protection with exact skips disabled. */
+static void
+test_isolate_mprotect_foreign_write(void)
+{
+  void *volatile allocation;
+  volatile unsigned char *page;
+  unsigned count;
+  unsigned char previous;
+  pthread_t writer;
+  unsigned long saved_time = GC_get_time_limit();
+  int saved_frequency = GC_get_full_freq();
+
+  if (GC_get_actual_vdb() != GC_VDB_MPROTECT || GC_page_size != HBLKSIZE)
+    return;
+  GC_set_time_limit(GC_TIME_UNLIMITED);
+  GC_set_full_freq(0);
+  allocation = GC_malloc(2 * 1024 * 1024);
+  TEST_ASSERT(allocation != NULL);
+  page = (volatile unsigned char *)PTR_ALIGN_UP(
+      (ptr_t)allocation + 128 * HBLKSIZE, GC_page_size);
+  for (count = 0; count <= 33 && is_test_page_writable(page); ++count)
+    GC_gcollect();
+  TEST_ASSERT(!is_test_page_writable(page));
+  previous = *page;
+  TEST_ASSERT(pthread_create(&writer, NULL, test_foreign_page_write,
+                            (void *)page) == 0);
+  TEST_ASSERT(pthread_join(writer, NULL) == 0);
+  TEST_ASSERT(*page == (unsigned char)(previous + 1));
+  TEST_ASSERT(is_test_page_writable(page));
+  TEST_ASSERT(GC_isolate_vdb_has_foreign_writes());
+  for (count = 0; count <= 33 && is_test_page_writable(page); ++count)
+    GC_gcollect();
+  TEST_ASSERT(!is_test_page_writable(page));
+  TEST_ASSERT(test_write_and_wait_for_protection(page) <= 32);
+  TEST_ASSERT(GC_isolate_vdb_has_foreign_writes());
+  GC_free((void *)allocation);
+  allocation = NULL;
+  GC_set_full_freq(saved_frequency);
+  GC_set_time_limit(saved_time);
+  GC_printf("Tested foreign-write recovery and owner reprotection\n");
+}
 #  endif
 #endif
 
@@ -2621,6 +2844,9 @@ main(void)
   test_isolate_committed_ranges();
 #  if defined(LINUX) && !defined(GC_DISABLE_INCREMENTAL)
   test_full_collection_tracking();
+  test_isolate_protection_eligibility();
+  test_isolate_mprotect_aging();
+  test_isolate_mprotect_foreign_write();
 #  endif
 #endif
   GC_set_min_bytes_allocd(1);

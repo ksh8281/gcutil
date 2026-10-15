@@ -514,6 +514,9 @@ GC_isolate_vdb_drain_pending(void)
     for (read = first; read < last; ++read) {
       ptr_t address = pending_queue[read];
       if (GC_find_header(address) != NULL) {
+#  if defined(LINUX)
+        GC_coarse_note_foreign_write(address, HBLKSIZE);
+#  endif
         GC_isolate_dirty_page(address);
         GC_COND_LOG_PRINTF("Claiming cross-isolate dirty page %p into this thread's own dirty bitmap\n",
                            (void *)address);

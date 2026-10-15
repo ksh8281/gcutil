@@ -2125,6 +2125,9 @@ GC_deinit(void)
   GC_incremental_start_pending = FALSE;
   GC_incremental_start_threshold = 0;
 #endif
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+  GC_coarse_protection_deinit();
+#endif
 
 #  if defined(ESCARGOT_USE_32BIT_IN_64BIT)
   GC_release_cage();
