@@ -4010,6 +4010,9 @@ GC_INNER GC_bool GC_dirty_init(void);
 
 #if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
 GC_INNER void GC_coarse_protection_deinit(void);
+GC_INNER void GC_coarse_note_eligibility(ptr_t start, size_t bytes,
+                                         GC_bool eligible);
+GC_INNER void GC_coarse_invalidate_eligibility(void);
 GC_INNER void GC_coarse_note_rw_remap(ptr_t start, size_t bytes);
 GC_INNER void GC_coarse_note_foreign_write(ptr_t start, size_t bytes);
 #endif

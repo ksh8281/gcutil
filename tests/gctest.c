@@ -1689,6 +1689,65 @@ test_isolate_mprotect_aging(void)
   GC_printf("Tested isolate mprotect grace growth and cold-page reset\n");
 }
 
+/* Alternate atomic and pointer-containing allocations in reused blocks,
+   force free-page unmapping and heap growth, and check live data after GC.
+   GC_MPROTECT_VERIFY_ELIGIBILITY compares every protection pass with the
+   original header walk, including newly added sections. */
+static void
+test_isolate_protection_eligibility(void)
+{
+  const char *coarse = getenv("GC_MPROTECT_COARSE");
+  void *volatile objects[32] = { NULL };
+  size_t lengths[32] = { 0 };
+  unsigned char values[32] = { 0 };
+  const size_t blocks[] = { 1, 3, 17, 65, 2 };
+  unsigned round, slot;
+
+  if (GC_get_actual_vdb() != GC_VDB_MPROTECT || coarse == NULL
+      || coarse[0] == '0' || GC_page_size != HBLKSIZE)
+    return;
+  for (round = 0; round < 24; ++round) {
+    if (round % 8 == 0)
+      TEST_ASSERT(GC_expand_hp(2 * 1024 * 1024));
+    for (slot = 0; slot < 32; ++slot) {
+      if ((slot + round) % 3 != 0)
+        continue;
+      if (objects[slot] != NULL) {
+        GC_free((void *)objects[slot]);
+        objects[slot] = NULL;
+      }
+      lengths[slot] = blocks[(slot + round) % 5] * HBLKSIZE - 2 * GC_GRANULE_BYTES;
+      objects[slot] = (slot + round) % 2 == 0
+                          ? GC_malloc(lengths[slot])
+                          : GC_malloc_atomic(lengths[slot]);
+      TEST_ASSERT(objects[slot] != NULL);
+      values[slot] = (unsigned char)(slot + round + 1);
+      ((unsigned char *)objects[slot])[0] = values[slot];
+      ((unsigned char *)objects[slot])[lengths[slot] - 1] = values[slot];
+    }
+    if (round % 3 == 0)
+      GC_gcollect_and_unmap();
+    else
+      GC_gcollect();
+    for (slot = 0; slot < 32; ++slot) {
+      if (objects[slot] != NULL) {
+        TEST_ASSERT(((unsigned char *)objects[slot])[0] == values[slot]);
+        TEST_ASSERT(((unsigned char *)objects[slot])[lengths[slot] - 1]
+                    == values[slot]);
+      }
+    }
+  }
+  for (slot = 0; slot < 32; ++slot) {
+    if (objects[slot] != NULL) {
+      GC_free((void *)objects[slot]);
+      objects[slot] = NULL;
+    }
+  }
+  GC_gcollect_and_unmap();
+  GC_gcollect();
+  GC_printf("Tested protection eligibility updates across allocation and unmapping\n");
+}
+
 static void *
 test_foreign_page_write(void *argument)
 {
@@ -2721,6 +2780,7 @@ main(void)
 #if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
   test_isolate_committed_ranges();
 #  if defined(LINUX) && !defined(GC_DISABLE_INCREMENTAL)
+  test_isolate_protection_eligibility();
   test_isolate_mprotect_aging();
   test_isolate_mprotect_foreign_write();
 #  endif

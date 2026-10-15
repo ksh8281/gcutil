@@ -2991,6 +2991,10 @@ block_unmap_inner(ptr_t start_addr, size_t len)
 {
   if (NULL == start_addr)
     return;
+#  if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+      && !defined(GC_DISABLE_INCREMENTAL)
+  GC_coarse_note_eligibility(start_addr, len, FALSE);
+#  endif
 
 #  ifdef USE_WINALLOC
   /*
@@ -3103,6 +3107,10 @@ GC_remap(ptr_t start, size_t bytes)
     return;
   }
   GC_isolate_vdb_note_remap(start_addr, (size_t)(end_addr - start_addr));
+#  if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+      && !defined(GC_DISABLE_INCREMENTAL)
+  GC_coarse_note_eligibility(start_addr, (size_t)len, TRUE);
+#  endif
 
   /* FIXME: Handle out-of-memory correctly (at least for Win32). */
 #  ifdef USE_WINALLOC
@@ -3678,6 +3686,7 @@ typedef struct {
   ptr_t owned_begin;
   ptr_t owned_end;
   unsigned char *protected_pages;
+  word *eligible_pages;
   GC_coarse_page *history;
 } GC_coarse_section;
 
@@ -3695,6 +3704,10 @@ STATIC MAY_THREAD_LOCAL word GC_coarse_splits;
 STATIC MAY_THREAD_LOCAL word GC_coarse_dirty_pages;
 STATIC MAY_THREAD_LOCAL word GC_coarse_age_gc_no;
 STATIC MAY_THREAD_LOCAL word GC_coarse_deferred_pages;
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_eligibility_ready;
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_verify_eligibility;
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_eligibility_matches;
+STATIC MAY_THREAD_LOCAL word GC_coarse_expected_pages;
 
 STATIC void
 GC_coarse_discard_cache(void)
@@ -3702,6 +3715,7 @@ GC_coarse_discard_cache(void)
   size_t i;
   for (i = 0; i < GC_coarse_section_count; ++i) {
     free(GC_coarse_sections[i].protected_pages);
+    free(GC_coarse_sections[i].eligible_pages);
     free(GC_coarse_sections[i].history);
   }
   free(GC_coarse_sections);
@@ -3709,6 +3723,7 @@ GC_coarse_discard_cache(void)
   GC_coarse_section_count = GC_coarse_section_capacity
       = GC_coarse_last_section = 0;
   GC_coarse_enabled = FALSE;
+  GC_coarse_eligibility_ready = FALSE;
 }
 
 GC_INNER void
@@ -3727,6 +3742,7 @@ GC_coarse_sync_sections(void)
   if (!GC_coarse_enabled || old_count == GC_n_heap_sects)
     return;
   GC_ASSERT(old_count < GC_n_heap_sects);
+  GC_coarse_eligibility_ready = FALSE;
   sections = GC_coarse_sections;
   if (GC_n_heap_sects > GC_coarse_section_capacity) {
     size_t capacity = GC_coarse_section_capacity != 0
@@ -3759,8 +3775,11 @@ GC_coarse_sync_sections(void)
     sections[i].start = GC_heap_sects[i].hs_start;
     sections[i].end = sections[i].start + GC_heap_sects[i].hs_bytes;
     sections[i].protected_pages = (unsigned char *)calloc((pages + 7) / 8, 1);
+    sections[i].eligible_pages = (word *)calloc(
+        divWORDSZ(pages + CPP_WORDSZ - 1), sizeof(word));
     sections[i].history = (GC_coarse_page *)calloc(pages, sizeof(GC_coarse_page));
-    if (sections[i].protected_pages == NULL || sections[i].history == NULL) {
+    if (sections[i].protected_pages == NULL || sections[i].history == NULL
+        || sections[i].eligible_pages == NULL) {
       GC_coarse_discard_cache();
       return;
     }
@@ -3818,6 +3837,52 @@ GC_coarse_find_section(ptr_t address)
     }
   }
   return NULL;
+}
+
+GC_INNER void
+GC_coarse_invalidate_eligibility(void)
+{
+  GC_coarse_eligibility_ready = FALSE;
+}
+
+/* No allocation and no header lookup on the allocation/free hot paths.
+   A new section invalidates the cache until the next complete rebuild. */
+GC_INNER void
+GC_coarse_note_eligibility(ptr_t start, size_t bytes, GC_bool eligible)
+{
+  ptr_t end = start + bytes;
+  if (!GC_coarse_enabled || !GC_coarse_eligibility_ready)
+    return;
+  if (GC_coarse_section_count != GC_n_heap_sects) {
+    GC_coarse_eligibility_ready = FALSE;
+    return;
+  }
+  while (ADDR_LT(start, end)) {
+    GC_coarse_section *section = GC_coarse_find_section(start);
+    ptr_t stop;
+    size_t first, last;
+    if (section == NULL) {
+      GC_coarse_eligibility_ready = FALSE;
+      return;
+    }
+    stop = ADDR_LT(end, section->end) ? end : section->end;
+    first = (size_t)(start - section->start) / HBLKSIZE;
+    last = (size_t)(stop - section->start) / HBLKSIZE;
+    while (first < last) {
+      unsigned shift = (unsigned)modWORDSZ(first);
+      size_t count = CPP_WORDSZ - shift;
+      word mask;
+      if (count > last - first)
+        count = last - first;
+      mask = (GC_WORD_MAX >> (CPP_WORDSZ - count)) << shift;
+      if (eligible)
+        section->eligible_pages[divWORDSZ(first)] |= mask;
+      else
+        section->eligible_pages[divWORDSZ(first)] &= ~mask;
+      first += count;
+    }
+    start = stop;
+  }
 }
 
 STATIC void
@@ -4505,6 +4570,8 @@ GC_dirty_init(void)
       = GC_coarse_dirty_pages = 0;
   GC_coarse_age_gc_no = GC_gc_no;
   GC_coarse_deferred_pages = 0;
+  GC_coarse_verify_eligibility
+      = GETENV("GC_MPROTECT_VERIFY_ELIGIBILITY") != NULL;
 #      endif
 #      ifndef NO_CLOCK
   /* Per-call clocks can materially perturb short mprotect calls on ARM.
@@ -5729,7 +5796,7 @@ uffdwp_register_heap_lazy(void)
 
 #if defined(MPROTECT_VDB) || defined(UFFDWP_VDB)
 STATIC void
-GC_visit_protection_ranges(void (*visit)(ptr_t, size_t))
+GC_visit_protection_ranges_from_headers(void (*visit)(ptr_t, size_t))
 {
   size_t i;
 
@@ -5832,6 +5899,150 @@ GC_visit_protection_ranges(void (*visit)(ptr_t, size_t))
         current_start = current;
     }
   }
+}
+
+#  ifdef GC_COARSE_MPROTECT
+STATIC void
+GC_coarse_record_eligible_range(ptr_t start, size_t bytes)
+{
+  GC_coarse_note_eligibility(start, bytes, TRUE);
+}
+
+STATIC unsigned
+GC_coarse_trailing_zeroes(word bits)
+{
+#    if defined(__GNUC__) || defined(__clang__)
+  return (unsigned)__builtin_ctzl((unsigned long)bits);
+#    else
+  unsigned count = 0;
+  while ((bits & 1) == 0) {
+    bits >>= 1;
+    ++count;
+  }
+  return count;
+#    endif
+}
+
+STATIC void
+GC_coarse_check_eligible_range(ptr_t start, size_t bytes)
+{
+  ptr_t end = start + bytes;
+  while (ADDR_LT(start, end)) {
+    GC_coarse_section *section = GC_coarse_find_section(start);
+    ptr_t stop;
+    size_t page, last;
+    if (section == NULL) {
+      GC_coarse_eligibility_matches = FALSE;
+      return;
+    }
+    stop = ADDR_LT(end, section->end) ? end : section->end;
+    page = (size_t)(start - section->start) / HBLKSIZE;
+    last = (size_t)(stop - section->start) / HBLKSIZE;
+    for (; page < last; ++page) {
+      if ((section->eligible_pages[divWORDSZ(page)]
+           & ((word)1 << modWORDSZ(page))) == 0)
+        GC_coarse_eligibility_matches = FALSE;
+      ++GC_coarse_expected_pages;
+    }
+    start = stop;
+  }
+}
+
+/* The header walk is the independent reference: every expected bit must
+   be present, and equal populations rule out any unexpected extra bit. */
+STATIC void
+GC_coarse_check_eligibility(void)
+{
+  word actual = 0;
+  size_t i;
+  GC_coarse_eligibility_matches = TRUE;
+  GC_coarse_expected_pages = 0;
+  GC_visit_protection_ranges_from_headers(GC_coarse_check_eligible_range);
+  for (i = 0; i < GC_coarse_section_count; ++i) {
+    GC_coarse_section *section = &GC_coarse_sections[i];
+    size_t pages = (size_t)(section->end - section->start) / HBLKSIZE;
+    size_t index, words = divWORDSZ(pages + CPP_WORDSZ - 1);
+    for (index = 0; index < words; ++index) {
+      word bits = section->eligible_pages[index];
+      while (bits != 0) {
+        bits &= bits - 1;
+        ++actual;
+      }
+    }
+  }
+  if (!GC_coarse_eligibility_matches || actual != GC_coarse_expected_pages)
+    ABORT("Protection eligibility bitmap differs from block headers");
+}
+
+STATIC void
+GC_coarse_visit_eligible_ranges(void (*visit)(ptr_t, size_t))
+{
+  ptr_t run = NULL, end = NULL;
+  size_t i;
+  /* Bitmap runs include mapped free gaps.  Keep the allocation fallback
+     aware of possible free-page protection even if this cache is lost. */
+  GC_coarse_free_protected = TRUE;
+  for (i = 0; i < GC_coarse_section_count; ++i) {
+    GC_coarse_section *section = &GC_coarse_sections[i];
+    size_t pages = (size_t)(section->end - section->start) / HBLKSIZE;
+    size_t index, words = divWORDSZ(pages + CPP_WORDSZ - 1);
+    for (index = 0; index < words; ++index) {
+      word bits = section->eligible_pages[index];
+      size_t offset = index * CPP_WORDSZ;
+      while (bits != 0) {
+        unsigned skip = GC_coarse_trailing_zeroes(bits), count;
+        ptr_t first, last;
+        offset += skip;
+        bits >>= skip;
+        count = bits == GC_WORD_MAX ? CPP_WORDSZ
+                                    : GC_coarse_trailing_zeroes(~bits);
+        first = section->start + offset * HBLKSIZE;
+        last = first + (size_t)count * HBLKSIZE;
+        if (run != NULL && end != first) {
+          visit(run, (size_t)(end - run));
+          run = NULL;
+        }
+        if (run == NULL)
+          run = first;
+        end = last;
+        offset += count;
+        bits = count == CPP_WORDSZ ? 0 : bits >> count;
+      }
+    }
+  }
+  if (run != NULL)
+    visit(run, (size_t)(end - run));
+}
+#  endif
+
+STATIC void
+GC_visit_protection_ranges(void (*visit)(ptr_t, size_t))
+{
+#  ifdef GC_COARSE_MPROTECT
+  if (GC_coarse_enabled && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()) {
+    size_t i;
+    GC_coarse_sync_sections();
+    if (GC_coarse_enabled) {
+      if (!GC_coarse_eligibility_ready) {
+        for (i = 0; i < GC_coarse_section_count; ++i) {
+          GC_coarse_section *section = &GC_coarse_sections[i];
+          size_t pages = (size_t)(section->end - section->start) / HBLKSIZE;
+          BZERO(section->eligible_pages,
+                divWORDSZ(pages + CPP_WORDSZ - 1) * sizeof(word));
+        }
+        GC_coarse_eligibility_ready = TRUE;
+        GC_visit_protection_ranges_from_headers(GC_coarse_record_eligible_range);
+      }
+      if (GC_coarse_eligibility_ready) {
+        if (GC_coarse_verify_eligibility)
+          GC_coarse_check_eligibility();
+        GC_coarse_visit_eligible_ranges(visit);
+        return;
+      }
+    }
+  }
+#  endif
+  GC_visit_protection_ranges_from_headers(visit);
 }
 
 #  if defined(COUNT_PROTECTED_REGIONS) && defined(MPROTECT_VDB)
