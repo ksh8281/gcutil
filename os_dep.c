@@ -3685,7 +3685,7 @@ typedef struct {
   ptr_t end;
   ptr_t owned_begin;
   ptr_t owned_end;
-  unsigned char *protected_pages;
+  word *protected_pages;
   word *eligible_pages;
   GC_coarse_page *history;
 } GC_coarse_section;
@@ -3774,7 +3774,8 @@ GC_coarse_sync_sections(void)
     size_t pages = GC_heap_sects[i].hs_bytes / GC_page_size;
     sections[i].start = GC_heap_sects[i].hs_start;
     sections[i].end = sections[i].start + GC_heap_sects[i].hs_bytes;
-    sections[i].protected_pages = (unsigned char *)calloc((pages + 7) / 8, 1);
+    sections[i].protected_pages = (word *)calloc(
+        divWORDSZ(pages + CPP_WORDSZ - 1), sizeof(word));
     sections[i].eligible_pages = (word *)calloc(
         divWORDSZ(pages + CPP_WORDSZ - 1), sizeof(word));
     sections[i].history = (GC_coarse_page *)calloc(pages, sizeof(GC_coarse_page));
@@ -3813,30 +3814,62 @@ GC_coarse_sync_sections(void)
   GC_coarse_last_section = 0;
 }
 
-static GC_coarse_section *
-GC_coarse_find_section(ptr_t address)
+/* First section whose end exceeds address, including an overlap that
+   starts in a gap.  The cache serves ordinary single-section faults;
+   binary search bounds the cost for scattered writes and long hints. */
+static size_t
+GC_coarse_first_section(ptr_t address)
 {
   size_t low = 0, high = GC_coarse_section_count;
   GC_coarse_section *section;
 
   if (high == 0)
-    return NULL;
+    return 0;
   section = &GC_coarse_sections[GC_coarse_last_section];
   if (ADDR_GE(address, section->start) && ADDR_LT(address, section->end))
-    return section;
+    return GC_coarse_last_section;
   while (low < high) {
     size_t mid = low + (high - low) / 2;
-    section = &GC_coarse_sections[mid];
-    if (ADDR_LT(address, section->start)) {
-      high = mid;
-    } else if (ADDR_GE(address, section->end)) {
+    if (ADDR_GE(address, GC_coarse_sections[mid].end))
       low = mid + 1;
-    } else {
-      GC_coarse_last_section = mid;
-      return section;
-    }
+    else
+      high = mid;
   }
-  return NULL;
+  if (low < GC_coarse_section_count)
+    GC_coarse_last_section = low;
+  return low;
+}
+
+static GC_coarse_section *
+GC_coarse_find_section(ptr_t address)
+{
+  size_t index = GC_coarse_first_section(address);
+  if (index == GC_coarse_section_count
+      || ADDR_LT(address, GC_coarse_sections[index].start))
+    return NULL;
+  return &GC_coarse_sections[index];
+}
+
+STATIC word
+GC_coarse_page_mask(size_t first, size_t count)
+{
+  GC_ASSERT(count != 0 && count <= CPP_WORDSZ - modWORDSZ(first));
+  return (GC_WORD_MAX >> (CPP_WORDSZ - count)) << modWORDSZ(first);
+}
+
+STATIC unsigned
+GC_coarse_trailing_zeroes(word bits)
+{
+#    if defined(__GNUC__) || defined(__clang__)
+  return (unsigned)__builtin_ctzl((unsigned long)bits);
+#    else
+  unsigned count = 0;
+  while ((bits & 1) == 0) {
+    bits >>= 1;
+    ++count;
+  }
+  return count;
+#    endif
 }
 
 GC_INNER void
@@ -3897,7 +3930,8 @@ GC_coarse_age_page(GC_coarse_section *section, size_t page, word gc_no)
   state->updated_gc_no = gc_no;
   state->delay = state->delay > elapsed
                      ? (unsigned char)(state->delay - elapsed) : 0;
-  if ((section->protected_pages[page >> 3] & (1U << (page & 7))) != 0) {
+  if ((section->protected_pages[divWORDSZ(page)]
+       & ((word)1 << modWORDSZ(page))) != 0) {
     word age = (word)state->protected_cycles + elapsed;
     state->protected_cycles = (unsigned char)(age < 2 ? age : 2);
     if (age >= 2)
@@ -3944,12 +3978,11 @@ GC_coarse_note_activity(ptr_t start, size_t bytes, GC_bool fault,
   if (!GC_coarse_enabled || GC_manual_vdb || IS_NON_MPROTECT_VDB())
     return;
   GC_coarse_advance_age(gc_no);
-  for (i = 0; i < GC_coarse_section_count; ++i) {
+  for (i = GC_coarse_first_section(start);
+       i < GC_coarse_section_count; ++i) {
     GC_coarse_section *section = &GC_coarse_sections[i];
     ptr_t first, last;
     size_t page, limit;
-    if (ADDR_GE(start, section->end))
-      continue;
     if (ADDR_GE(section->start, end))
       break;
     first = ADDR_LT(start, section->start) ? section->start : start;
@@ -3984,16 +4017,9 @@ STATIC void
 GC_coarse_record_protection(ptr_t start, size_t len, GC_bool protected)
 {
   ptr_t end = start + len;
-  size_t low = 0, high = GC_coarse_section_count;
+  size_t low = GC_coarse_first_section(start);
   word gc_no = GC_gc_no;
   GC_coarse_advance_age(gc_no);
-  while (low < high) {
-    size_t mid = low + (high - low) / 2;
-    if (ADDR_GE(start, GC_coarse_sections[mid].end))
-      low = mid + 1;
-    else
-      high = mid;
-  }
   while (ADDR_LT(start, end)) {
     GC_coarse_section *section;
     ptr_t stop;
@@ -4008,61 +4034,31 @@ GC_coarse_record_protection(ptr_t start, size_t len, GC_bool protected)
     stop = ADDR_LT(end, section->end) ? end : section->end;
     first = (size_t)(start - section->start) / GC_page_size;
     last = (size_t)(stop - section->start) / GC_page_size;
-    {
-      size_t page;
-      for (page = first; page < last;) {
-        GC_coarse_page *state = &section->history[page];
-        if (protected) {
-          /* An unchanged permission needs no history update.  Skip
-             dense protected runs a bitmap byte at a time. */
-          if ((page & 7) == 0 && last - page >= 8
-              && section->protected_pages[page >> 3] == 0xff) {
-            page += 8;
-            continue;
-          }
-          if ((section->protected_pages[page >> 3]
-               & (1U << (page & 7))) != 0) {
-            ++page;
-            continue;
-          }
-        }
-        GC_coarse_age_page(section, page, gc_no);
-        if (!protected) {
-          /* Writable neighbours share a bounded grace period, without
-             treating the exposure as an observed fault or increasing
-             their backoff.  Every deferred page remains dirty. */
-          if (state->delay < 16)
-            state->delay = 16;
-          state->protected_cycles = state->probed = 0;
-        } else if ((section->protected_pages[page >> 3]
-                     & (1U << (page & 7))) == 0) {
-          state->protected_cycles = 0;
-          state->probed = 1;
-        }
-        ++page;
-      }
-    }
-    while (first < last && (first & 7) != 0) {
-      unsigned char mask = (unsigned char)(1U << (first & 7));
-      if (protected)
-        section->protected_pages[first >> 3] |= mask;
-      else
-        section->protected_pages[first >> 3] &= (unsigned char)~mask;
-      ++first;
-    }
-    if (last - first >= 8) {
-      size_t bytes = (last - first) / 8;
-      memset(section->protected_pages + (first >> 3), protected ? 0xff : 0,
-             bytes);
-      first += bytes * 8;
-    }
     while (first < last) {
-      unsigned char mask = (unsigned char)(1U << (first & 7));
+      size_t index = divWORDSZ(first);
+      size_t count = CPP_WORDSZ - modWORDSZ(first);
+      word mask, changed;
+      if (count > last - first)
+        count = last - first;
+      mask = GC_coarse_page_mask(first, count);
+      /* Only newly protected pages need history updates.  Unprotection
+         retains the existing reset for every page in a writable batch. */
+      changed = protected ? ~section->protected_pages[index] & mask : mask;
+      while (changed != 0) {
+        size_t page = index * CPP_WORDSZ + GC_coarse_trailing_zeroes(changed);
+        GC_coarse_page *state = &section->history[page];
+        GC_coarse_age_page(section, page, gc_no);
+        if (!protected && state->delay < 16)
+          state->delay = 16;
+        state->protected_cycles = 0;
+        state->probed = protected ? 1 : 0;
+        changed &= changed - 1;
+      }
       if (protected)
-        section->protected_pages[first >> 3] |= mask;
+        section->protected_pages[index] |= mask;
       else
-        section->protected_pages[first >> 3] &= (unsigned char)~mask;
-      ++first;
+        section->protected_pages[index] &= ~mask;
+      first += count;
     }
     start = stop;
   }
@@ -4097,25 +4093,15 @@ GC_coarse_has_permission(ptr_t start, size_t len, GC_bool protected)
     stop = ADDR_LT(end, section->end) ? end : section->end;
     first = (size_t)(start - section->start) / GC_page_size;
     last = (size_t)(stop - section->start) / GC_page_size;
-    while (first < last && (first & 7) != 0) {
-      GC_bool bit = (section->protected_pages[first >> 3]
-                     & (1U << (first & 7))) != 0;
-      if (bit == protected)
-        return TRUE;
-      ++first;
-    }
-    while (last - first >= 8) {
-      unsigned char bits = section->protected_pages[first >> 3];
-      if (protected ? bits != 0 : bits != 0xff)
-        return TRUE;
-      first += 8;
-    }
     while (first < last) {
-      GC_bool bit = (section->protected_pages[first >> 3]
-                     & (1U << (first & 7))) != 0;
-      if (bit == protected)
+      size_t count = CPP_WORDSZ - modWORDSZ(first);
+      word bits = section->protected_pages[divWORDSZ(first)];
+      if (count > last - first)
+        count = last - first;
+      if (((protected ? bits : ~bits)
+           & GC_coarse_page_mask(first, count)) != 0)
         return TRUE;
-      ++first;
+      first += count;
     }
     start = stop;
   }
@@ -5908,21 +5894,6 @@ GC_coarse_record_eligible_range(ptr_t start, size_t bytes)
   GC_coarse_note_eligibility(start, bytes, TRUE);
 }
 
-STATIC unsigned
-GC_coarse_trailing_zeroes(word bits)
-{
-#    if defined(__GNUC__) || defined(__clang__)
-  return (unsigned)__builtin_ctzl((unsigned long)bits);
-#    else
-  unsigned count = 0;
-  while ((bits & 1) == 0) {
-    bits >>= 1;
-    ++count;
-  }
-  return count;
-#    endif
-}
-
 STATIC void
 GC_coarse_check_eligible_range(ptr_t start, size_t bytes)
 {
@@ -6150,51 +6121,60 @@ GC_protect_range(ptr_t start, size_t len)
 {
 #  ifdef GC_COARSE_MPROTECT
   if (GC_coarse_enabled && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()) {
-    ptr_t page, run = start, end = start + len;
-    GC_coarse_section *section = NULL;
+    ptr_t cursor = start, run = start, end = start + len;
     size_t dirty_word = 0;
     word dirty_mask = 0;
     word gc_no = GC_gc_no;
     GC_coarse_advance_age(gc_no);
-    for (page = start; ADDR_LT(page, end); page += GC_page_size) {
-      size_t index;
-      if (section == NULL || ADDR_GE(page, section->end))
-        section = GC_coarse_find_section(page);
-      if (section == NULL)
+    while (ADDR_LT(cursor, end)) {
+      GC_coarse_section *section = GC_coarse_find_section(cursor);
+      ptr_t stop;
+      size_t first, last;
+      if (section == NULL) {
+        cursor += GC_page_size;
         continue; /* Unknown pages use the normal protection path. */
-      index = (size_t)(page - section->start) / GC_page_size;
-      /* A protected page has no outstanding grace: writes and write
-         hints clear its permission bit before another protection pass.
-         Leave its cold history untouched until a later write needs it. */
-      if ((index & 7) == 0
-          && section->protected_pages[index >> 3] == 0xff
-          && (size_t)(section->end - page) >= 8 * (size_t)GC_page_size
-          && (size_t)(end - page) >= 8 * (size_t)GC_page_size) {
-        page += 7 * (size_t)GC_page_size;
-        continue;
       }
-      if ((section->protected_pages[index >> 3]
-           & (1U << (index & 7))) != 0)
-        continue;
-      GC_coarse_age_page(section, index, gc_no);
-      if (section->history[index].delay == 0)
-        continue;
-      if (ADDR_LT(run, page))
-        GC_protect_range_inner(run, (size_t)(page - run));
-      /* No writes can be observed while this page is writable.  Renew
-         its dirty bit after every snapshot, including rescue passes. */
-      {
-        size_t hash = PHT_HASH((struct hblk *)page);
-        size_t next_word = divWORDSZ(hash);
-        if (dirty_mask != 0 && next_word != dirty_word) {
-          GC_coarse_publish_dirty_mask(dirty_word, dirty_mask);
-          dirty_mask = 0;
+      stop = ADDR_LT(end, section->end) ? end : section->end;
+      first = (size_t)(cursor - section->start) / GC_page_size;
+      last = (size_t)(stop - section->start) / GC_page_size;
+      while (first < last) {
+        size_t index = divWORDSZ(first);
+        size_t count = CPP_WORDSZ - modWORDSZ(first);
+        word pending;
+        if (count > last - first)
+          count = last - first;
+        /* Protected pages have no outstanding grace.  Iterate only
+           writable bits, leaving cold protected history untouched. */
+        pending = ~section->protected_pages[index]
+                  & GC_coarse_page_mask(first, count);
+        while (pending != 0) {
+          size_t page = index * CPP_WORDSZ
+                        + GC_coarse_trailing_zeroes(pending);
+          ptr_t address = section->start + page * GC_page_size;
+          pending &= pending - 1;
+          GC_coarse_age_page(section, page, gc_no);
+          if (section->history[page].delay == 0)
+            continue;
+          if (ADDR_LT(run, address))
+            GC_protect_range_inner(run, (size_t)(address - run));
+          /* Writable grace pages remain dirty after every snapshot,
+             including rescue passes. */
+          {
+            size_t hash = PHT_HASH((struct hblk *)address);
+            size_t next_word = divWORDSZ(hash);
+            if (dirty_mask != 0 && next_word != dirty_word) {
+              GC_coarse_publish_dirty_mask(dirty_word, dirty_mask);
+              dirty_mask = 0;
+            }
+            dirty_word = next_word;
+            dirty_mask |= (word)1 << modWORDSZ(hash);
+          }
+          ++GC_coarse_deferred_pages;
+          run = address + GC_page_size;
         }
-        dirty_word = next_word;
-        dirty_mask |= (word)1 << modWORDSZ(hash);
+        first += count;
       }
-      ++GC_coarse_deferred_pages;
-      run = page + GC_page_size;
+      cursor = stop;
     }
     if (dirty_mask != 0)
       GC_coarse_publish_dirty_mask(dirty_word, dirty_mask);

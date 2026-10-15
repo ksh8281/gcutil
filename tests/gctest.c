@@ -1649,6 +1649,8 @@ static void
 test_isolate_mprotect_aging(void)
 {
   const char *coarse = getenv("GC_MPROTECT_COARSE");
+  const size_t offsets[] = { 0, 1, 31, 32, 33, 63, 64, 65,
+                             127, 128, 129, 255, 256, 510 };
   void *volatile allocation;
   volatile unsigned char *page;
   unsigned count, first_grace, round;
@@ -1681,6 +1683,32 @@ test_isolate_mprotect_aging(void)
   GC_gcollect();
   GC_gcollect();
   TEST_ASSERT(test_write_and_wait_for_protection(page) == first_grace);
+  /* Exercise partial words and both 32- and 64-bit bitmap boundaries.
+     Each probe must fault and become protected again after its grace. */
+  for (round = 0; round < sizeof(offsets) / sizeof(offsets[0]); ++round) {
+    page = (volatile unsigned char *)PTR_ALIGN_UP((ptr_t)allocation,
+                                                 GC_page_size)
+           + offsets[round] * GC_page_size;
+    TEST_ASSERT(test_write_and_wait_for_protection(page) <= 32);
+  }
+  /* One hint spans several bitmap words, unlike the single-page faults. */
+  page = (volatile unsigned char *)PTR_ALIGN_UP((ptr_t)allocation,
+                                               GC_page_size)
+         + 31 * GC_page_size;
+  GC_remove_protection((struct hblk *)page, 67, FALSE);
+  for (round = 0; round < 67; ++round)
+    page[round * GC_page_size] = (unsigned char)round;
+  for (count = 0; count <= 33; ++count) {
+    GC_gcollect();
+    if (!is_test_page_writable(page)
+        && !is_test_page_writable(page + 66 * GC_page_size))
+      break;
+  }
+  TEST_ASSERT(count <= 33);
+  for (round = 0; round < 67; ++round) {
+    TEST_ASSERT(!is_test_page_writable(page + round * GC_page_size));
+    TEST_ASSERT(page[round * GC_page_size] == (unsigned char)round);
+  }
   GC_free((void *)allocation);
   allocation = NULL;
   GC_set_adaptive_incremental(saved_adaptive);
