@@ -466,7 +466,7 @@ GC_generic_malloc_many(size_t lb_adjusted, int kind, void **result)
 
   LOCK();
   /* Do our share of marking work. */
-  if (GC_incremental && !GC_dont_gc) {
+  if (GC_incremental_collection && !GC_dont_gc) {
     GC_collect_a_little_inner(1);
   }
 

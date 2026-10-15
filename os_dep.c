@@ -4205,6 +4205,10 @@ GC_INNER void
 GC_dirty_update_child(void)
 {
   GC_ASSERT(I_HOLD_LOCK());
+#  ifndef GC_DISABLE_INCREMENTAL
+  /* The child cannot inherit a deferred request after its VDB is torn down. */
+  GC_incremental_start_pending = FALSE;
+#  endif
   if (-1 == GC_proc_fd) {
     /* The GC incremental mode is off. */
     return;
@@ -5629,7 +5633,8 @@ GC_dirty_update_child(void)
 
   GC_ASSERT(GC_mprotect_state == GC_MP_NORMAL);
   GC_task_self = mach_task_self(); /*< needed by `UNPROTECT()` */
-  GC_unprotect_all_heap();
+  if (GC_auto_incremental)
+    GC_unprotect_all_heap();
 
   /* Restore the old task exception ports. */
   /* TODO: Should we do it in `fork_prepare_proc`/`fork_parent_proc`? */

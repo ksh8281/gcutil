@@ -397,7 +397,7 @@ min_bytes_allocd(void)
   total_root_size = 2 * stack_size + GC_root_size;
   scan_size = 2 * GC_composite_in_use + GC_atomic_in_use / 4 + total_root_size;
   result = scan_size / GC_free_space_divisor;
-  if (GC_incremental) {
+  if (GC_incremental_collection) {
     result /= 2;
   }
   return result > min_bytes_allocd_minimum ? result : min_bytes_allocd_minimum;
@@ -557,7 +557,7 @@ GC_should_collect_before_hblk_alloc(void)
   word budget = MIN_BYTES_SINCE_GC_BEFORE_COLLECT;
 
   GC_ASSERT(I_HOLD_LOCK());
-  if (GC_dont_gc || GC_incremental || GC_disable_automatic_collection)
+  if (GC_dont_gc || GC_incremental_collection || GC_disable_automatic_collection)
     return FALSE;
 
   if (GC_allochblk_collect_divisor != 0) {
@@ -626,7 +626,7 @@ GC_maybe_gc(void)
   if (!GC_should_collect())
     return;
 
-  if (!GC_incremental) {
+  if (!GC_incremental_collection) {
     GC_gcollect_inner();
     return;
   }
@@ -1489,6 +1489,25 @@ GC_finish_collection(void)
   GC_bytes_freed = 0;
   GC_finalizer_bytes_freed = 0;
 
+#if !defined(GC_DISABLE_INCREMENTAL) && defined(MPROTECT_VDB)
+  if (GC_incremental_start_pending
+      && GC_used_heap_size_after_full >= GC_incremental_start_threshold) {
+    /* All reachable objects were traced by this ordinary full collection.
+       Start dirty tracking only after all live objects have been traced;
+       the first protection pass covers every pointer-bearing heap range. */
+    GC_incremental_start_pending = FALSE;
+    GC_incremental = TRUE;
+    GC_handle_protected_regions_limit();
+    if (GC_incremental) {
+      GC_read_dirty(TRUE);
+      if (GC_incremental)
+        GC_COND_LOG_PRINTF("Incremental mprotect activated after full collection #%lu: occupied heap %lu bytes, threshold %lu bytes\n",
+                           (unsigned long)GC_gc_no,
+                           (unsigned long)GC_used_heap_size_after_full,
+                           (unsigned long)GC_incremental_start_threshold);
+    }
+  }
+#endif
   if (GC_on_collection_event)
     GC_on_collection_event(GC_EVENT_RECLAIM_END);
 #ifndef NO_CLOCK
@@ -1985,7 +2004,7 @@ GC_collect_or_expand(word needed_blocks, unsigned flags, GC_bool retry)
   GC_ASSERT(I_HOLD_LOCK());
   GC_ASSERT(GC_is_initialized);
   DISABLE_CANCEL(cancel_state);
-  if (!GC_incremental && !GC_dont_gc
+  if (!GC_incremental_collection && !GC_dont_gc
       && ((GC_dont_expand && GC_bytes_allocd > 0)
           || (GC_fo_entries > last_fo_entries
               && (last_bytes_finalized | GC_bytes_finalized) != 0
@@ -2154,7 +2173,7 @@ GC_allocobj(size_t lg, int kind)
       break;
 
 #ifndef GC_DISABLE_INCREMENTAL
-    if (GC_incremental && GC_time_limit == GC_TIME_UNLIMITED && !tried_minor
+    if (GC_incremental_collection && GC_time_limit == GC_TIME_UNLIMITED && !tried_minor
         && !GC_dont_gc) {
       GC_collect_a_little_inner(1);
       tried_minor = TRUE;

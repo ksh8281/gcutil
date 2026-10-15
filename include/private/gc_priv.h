@@ -2062,6 +2062,7 @@ struct _GC_arrays {
 
 #ifdef GC_DISABLE_INCREMENTAL
 #  define GC_incremental FALSE
+#  define GC_incremental_start_pending FALSE
 #else
   /*
    * Using incremental/generational collection.  Assumes dirty bits are
@@ -2069,6 +2070,12 @@ struct _GC_arrays {
    */
 #  define GC_incremental GC_arrays._incremental
   GC_bool _incremental;
+
+  /* Preserve VDB initialization and section registration while collecting
+     small heaps without page protection.  Activation is one-way and only
+     follows a completed full mark. */
+#  define GC_incremental_start_pending GC_arrays._incremental_start_pending
+  GC_bool _incremental_start_pending;
 
 #  define GC_should_start_incremental_collection \
     GC_arrays._should_start_incremental_collection
@@ -3962,6 +3969,13 @@ GC_INNER void GC_stackbase_info_update_after_fork(void);
 #  endif
 #endif /* CAN_HANDLE_FORK */
 
+/* Dirty tracking can remain enabled for synchronous full collections.
+   Only collection scheduling should consult this predicate. */
+#define GC_incremental_collection \
+  (GC_incremental \
+   && (GC_full_freq != 0 || GC_time_limit != GC_TIME_UNLIMITED))
+GC_EXTERN MAY_THREAD_LOCAL word GC_incremental_start_threshold;
+
 #ifdef NO_MANUAL_VDB
 #  define GC_manual_vdb FALSE
 #  define GC_auto_incremental GC_incremental
@@ -3992,6 +4006,7 @@ GC_API_PATCHABLE void GC_dirty_inner(const void *p);
  * if the client calls `GC_enable_incremental()` once more).
  */
 GC_INNER GC_bool GC_dirty_init(void);
+
 
 #  ifdef UFFDWP_VDB
 /*

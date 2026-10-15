@@ -949,7 +949,7 @@ GC_allochblk_from_free_lists(size_t lb_adjusted, int kind, unsigned flags,
 
   if (GC_use_entire_heap || GC_dont_gc
       || GC_heapsize - GC_large_free_bytes < GC_requested_heapsize
-      || GC_incremental || !GC_should_collect()) {
+      || GC_incremental_collection || !GC_should_collect()) {
     /* Should use more of the heap, even if it requires splitting. */
     split_limit = N_HBLK_FLS;
   } else if (GC_finalizer_bytes_freed > (GC_heapsize >> 4)) {

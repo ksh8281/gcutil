@@ -1529,6 +1529,58 @@ set_stackbottom(void *cd)
   return NULL;
 }
 
+#if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+#  if defined(LINUX) && !defined(GC_DISABLE_INCREMENTAL)
+static unsigned long tracking_full_marks;
+
+static void GC_CALLBACK
+count_tracking_full_marks(void)
+{
+  ++tracking_full_marks;
+}
+
+/* Tracking must not change automatic collections into partial marks. */
+static void
+test_full_collection_tracking(void)
+{
+  GC_start_callback_proc saved_callback = GC_get_start_callback();
+  unsigned long saved_time_limit = GC_get_time_limit();
+  int saved_full_freq = GC_get_full_freq();
+  void *volatile owners[8] = { NULL };
+  GC_word initial_gc_no;
+  unsigned i;
+
+  if (GC_get_actual_vdb() != GC_VDB_MPROTECT)
+    return;
+  GC_enable_dirty_tracking(0);
+  TEST_ASSERT(GC_is_incremental_mode());
+  TEST_ASSERT(GC_get_full_freq() == 0);
+  TEST_ASSERT(GC_get_time_limit() == GC_TIME_UNLIMITED);
+  tracking_full_marks = 0;
+  GC_set_start_callback(count_tracking_full_marks);
+  initial_gc_no = GC_get_gc_no();
+  for (i = 0; i < 192; ++i) {
+    unsigned char *object = (unsigned char *)GC_malloc(256 * 1024);
+
+    TEST_ASSERT(object != NULL);
+    object[0] = (unsigned char)i;
+    object[256 * 1024 - 1] = (unsigned char)(i + 1);
+    owners[i % 8] = object;
+  }
+  GC_gcollect();
+  TEST_ASSERT(GC_get_gc_no() - initial_gc_no > 1);
+  TEST_ASSERT(tracking_full_marks == GC_get_gc_no() - initial_gc_no);
+  GC_set_start_callback(saved_callback);
+  GC_set_full_freq(saved_full_freq);
+  GC_set_time_limit(saved_time_limit);
+  for (i = 0; i < 8; ++i)
+    GC_free(owners[i]);
+  GC_printf("Tested full collections with dirty tracking enabled\n");
+}
+
+#  endif
+#endif
+
 static void
 run_one_test(void)
 {
@@ -2499,6 +2551,10 @@ main(void)
 #  endif
 #endif
   enable_incremental_mode();
+#if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+    && defined(LINUX) && !defined(GC_DISABLE_INCREMENTAL)
+  test_full_collection_tracking();
+#endif
   GC_set_min_bytes_allocd(1);
   TEST_ASSERT(GC_get_min_bytes_allocd() == 1);
   GC_set_rate(10);

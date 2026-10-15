@@ -342,7 +342,7 @@ GC_isolate_vdb_register_heap_sect(ptr_t start, size_t bytes)
      section added while it read TRUE can later "lose" its registration
      because incremental turned off, and no section added while it read
      FALSE was ever actually mprotect'd. */
-  if (!GC_incremental)
+  if (!GC_incremental && !GC_incremental_start_pending)
     return;
   GC_isolate_mutex_lock(&range_lock);
   if (ensure_range_capacity_locked(1)) {
@@ -364,7 +364,7 @@ GC_isolate_vdb_note_unmap(ptr_t start, size_t bytes)
   /* See the comment in GC_isolate_vdb_register_heap_sect(): a section
      never registered (because GC_incremental was off when it was added)
      has nothing to update here either. */
-  if (!GC_incremental || NULL == start || 0 == bytes)
+  if ((!GC_incremental && !GC_incremental_start_pending) || NULL == start || 0 == bytes)
     return;
   GC_isolate_mutex_lock(&range_lock);
   mark_range_locked(start, start + bytes, FALSE);
@@ -375,7 +375,7 @@ GC_isolate_vdb_note_unmap(ptr_t start, size_t bytes)
 GC_INNER void
 GC_isolate_vdb_note_remap(ptr_t start, size_t bytes)
 {
-  if (!GC_incremental || NULL == start || 0 == bytes)
+  if ((!GC_incremental && !GC_incremental_start_pending) || NULL == start || 0 == bytes)
     return;
   GC_isolate_mutex_lock(&range_lock);
   mark_range_locked(start, start + bytes, TRUE);
@@ -473,7 +473,7 @@ GC_isolate_vdb_deinit(void)
   /* This thread never registered anything if its own incremental mode
      was never on (see GC_isolate_vdb_register_heap_sect()); skip taking
      the locks below for that common case. */
-  if (!GC_incremental)
+  if (!GC_incremental && !GC_incremental_start_pending)
     return;
 
   GC_isolate_mutex_lock(&range_lock);
