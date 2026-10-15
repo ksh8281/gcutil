@@ -45,6 +45,13 @@ GC_INNER void GC_isolate_vdb_note_remap(ptr_t start, size_t bytes);
 GC_INNER GC_isolate_vdb_fault_kind GC_isolate_vdb_classify_fault(
     const void *addr);
 
+/* Return the committed registry interval containing addr.  The caller
+   must additionally clamp it to one of its own heap sections: adjacent
+   sections belonging to different isolates may share a registry entry. */
+GC_INNER GC_bool GC_isolate_vdb_committed_bounds(const void *addr,
+                                               ptr_t *start, ptr_t *end);
+GC_INNER GC_bool GC_isolate_vdb_has_foreign_writes(void);
+
 /* Called from the write-fault handler once GC_isolate_vdb_classify_fault()
    returned GC_ISOLATE_VDB_CROSS_ISOLATE, and BEFORE the page is
    unprotected. Enqueues all `n` consecutive hblk-sized pages starting

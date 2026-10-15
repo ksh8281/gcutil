@@ -1530,6 +1530,72 @@ set_stackbottom(void *cd)
 }
 
 #if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+/* Compare differently shaped unmap/remap ranges against a block oracle.
+   Use a live atomic allocation and restore every block before freeing it;
+   these calls test registry state without changing OS permissions. */
+static void
+test_isolate_committed_ranges(void)
+{
+  void *allocation;
+  ptr_t begin;
+  unsigned char expected[128];
+  unsigned seed = 12345;
+  size_t step, page;
+
+  if (!GC_incremental)
+    return;
+  allocation = GC_malloc_atomic(GC_get_heap_size() + 129 * HBLKSIZE);
+  TEST_ASSERT(allocation != NULL);
+  begin = PTR_ALIGN_UP((ptr_t)allocation, HBLKSIZE);
+  TEST_ASSERT(GC_isolate_vdb_classify_fault(begin)
+              == GC_ISOLATE_VDB_CROSS_ISOLATE);
+  memset(expected, 1, sizeof(expected));
+  for (step = 0; step < 512; ++step) {
+    size_t first, count;
+    GC_bool committed;
+
+    seed = seed * 1103515245U + 12345U;
+    first = (seed >> 16) % sizeof(expected);
+    seed = seed * 1103515245U + 12345U;
+    count = 1 + (seed >> 16) % (sizeof(expected) - first);
+    committed = ((seed >> 8) & 1) != 0;
+    if (committed)
+      GC_isolate_vdb_note_remap(begin + first * HBLKSIZE, count * HBLKSIZE);
+    else
+      GC_isolate_vdb_note_unmap(begin + first * HBLKSIZE, count * HBLKSIZE);
+    memset(expected + first, committed ? 1 : 0, count);
+    for (page = 0; page < sizeof(expected); ++page) {
+      ptr_t start, end, address = begin + page * HBLKSIZE;
+      GC_isolate_vdb_fault_kind kind = expected[page]
+                                           ? GC_ISOLATE_VDB_CROSS_ISOLATE
+                                           : GC_ISOLATE_VDB_DECOMMITTED;
+      GC_bool found;
+
+      TEST_ASSERT(GC_isolate_vdb_classify_fault(address) == kind);
+      TEST_ASSERT(GC_isolate_vdb_classify_fault(address + HBLKSIZE - 1)
+                  == kind);
+      found = GC_isolate_vdb_committed_bounds(address, &start, &end);
+      TEST_ASSERT(found == (expected[page] != 0));
+      if (found) {
+        size_t first_live = page, last_live = page + 1;
+
+        while (first_live > 0 && expected[first_live - 1])
+          --first_live;
+        while (last_live < sizeof(expected) && expected[last_live])
+          ++last_live;
+        TEST_ASSERT(first_live == 0 ? ADDR_GE(begin, start)
+                                    : start == begin + first_live * HBLKSIZE);
+        TEST_ASSERT(last_live == sizeof(expected)
+                        ? ADDR_GE(end, begin + sizeof(expected) * HBLKSIZE)
+                        : end == begin + last_live * HBLKSIZE);
+      }
+    }
+  }
+  GC_isolate_vdb_note_remap(begin, sizeof(expected) * HBLKSIZE);
+  TEST_ASSERT(GC_isolate_vdb_classify_fault(&seed) == GC_ISOLATE_VDB_UNKNOWN);
+  GC_free(allocation);
+  GC_printf("Tested isolate committed ranges against block state oracle\n");
+}
 #  if defined(LINUX) && !defined(GC_DISABLE_INCREMENTAL)
 static unsigned long tracking_full_marks;
 
@@ -2551,9 +2617,11 @@ main(void)
 #  endif
 #endif
   enable_incremental_mode();
-#if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
-    && defined(LINUX) && !defined(GC_DISABLE_INCREMENTAL)
+#if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+  test_isolate_committed_ranges();
+#  if defined(LINUX) && !defined(GC_DISABLE_INCREMENTAL)
   test_full_collection_tracking();
+#  endif
 #endif
   GC_set_min_bytes_allocd(1);
   TEST_ASSERT(GC_get_min_bytes_allocd() == 1);
