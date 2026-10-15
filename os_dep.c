@@ -5740,6 +5740,10 @@ GC_visit_protection_ranges(void (*visit)(ptr_t, size_t))
     struct hblk *current;
     struct hblk *current_start; /*< start of block to be protected */
     ptr_t limit;
+#  ifdef HASH_TL
+    bottom_index *bi = NULL;
+    word bi_key = GC_WORD_MAX;
+#  endif
 
     GC_ASSERT((ADDR(start) & (GC_page_size - 1)) == 0);
     GC_ASSERT((len & (GC_page_size - 1)) == 0);
@@ -5763,7 +5767,18 @@ GC_visit_protection_ranges(void (*visit)(ptr_t, size_t))
       if (ADDR_LT((ptr_t)current, limit)) {
         const hdr *hhdr;
 
+#  ifdef HASH_TL
+        /* Protection callbacks do not change this heap's header index.
+           Reuse one bottom table while walking its consecutive blocks. */
+        word key = ADDR(current) >> (LOG_BOTTOM_SZ + LOG_HBLKSIZE);
+        if (key != bi_key) {
+          GET_BI(current, bi);
+          bi_key = key;
+        }
+        hhdr = HDR_FROM_BI(bi, current);
+#  else
         GET_HDR(current, hhdr);
+#  endif
         if (IS_FORWARDING_ADDR_OR_NIL(hhdr)) {
           /*
            * This can happen only if we are at the beginning of a heap

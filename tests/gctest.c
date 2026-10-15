@@ -92,6 +92,9 @@
 #include "private/gc_priv.h"
 #if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
 #  include "private/vdb_isolate.h"
+#  if defined(LINUX)
+#    include <pthread.h>
+#  endif
 #endif
 
 #ifdef TEST_NO_THREADS
@@ -1685,6 +1688,63 @@ test_isolate_mprotect_aging(void)
   GC_set_time_limit(saved_time);
   GC_printf("Tested isolate mprotect grace growth and cold-page reset\n");
 }
+
+static void *
+test_foreign_page_write(void *argument)
+{
+  volatile unsigned char *page = (volatile unsigned char *)argument;
+  *page = (unsigned char)(*page + 1);
+  return NULL;
+}
+
+/* A plain thread has no local GC instance.  Its fault must publish the
+   foreign-write flag before recovery exposes the owner's page, and the
+   owner must subsequently restore protection with exact skips disabled. */
+static void
+test_isolate_mprotect_foreign_write(void)
+{
+  const char *coarse = getenv("GC_MPROTECT_COARSE");
+  void *volatile allocation;
+  volatile unsigned char *page;
+  unsigned count;
+  unsigned char previous;
+  pthread_t writer;
+  unsigned long saved_time = GC_get_time_limit();
+  int saved_frequency = GC_get_full_freq();
+  int saved_adaptive = GC_get_adaptive_incremental();
+
+  if (GC_get_actual_vdb() != GC_VDB_MPROTECT || coarse == NULL
+      || coarse[0] == '0' || GC_page_size != HBLKSIZE)
+    return;
+  GC_set_time_limit(GC_TIME_UNLIMITED);
+  GC_set_full_freq(0);
+  GC_set_adaptive_incremental(0);
+  allocation = GC_malloc(2 * 1024 * 1024);
+  TEST_ASSERT(allocation != NULL);
+  page = (volatile unsigned char *)PTR_ALIGN_UP(
+      (ptr_t)allocation + 128 * HBLKSIZE, GC_page_size);
+  for (count = 0; count <= 33 && is_test_page_writable(page); ++count)
+    GC_gcollect();
+  TEST_ASSERT(!is_test_page_writable(page));
+  previous = *page;
+  TEST_ASSERT(pthread_create(&writer, NULL, test_foreign_page_write,
+                            (void *)page) == 0);
+  TEST_ASSERT(pthread_join(writer, NULL) == 0);
+  TEST_ASSERT(*page == (unsigned char)(previous + 1));
+  TEST_ASSERT(is_test_page_writable(page));
+  TEST_ASSERT(GC_isolate_vdb_has_foreign_writes());
+  for (count = 0; count <= 33 && is_test_page_writable(page); ++count)
+    GC_gcollect();
+  TEST_ASSERT(!is_test_page_writable(page));
+  TEST_ASSERT(test_write_and_wait_for_protection(page) <= 32);
+  TEST_ASSERT(GC_isolate_vdb_has_foreign_writes());
+  GC_free((void *)allocation);
+  allocation = NULL;
+  GC_set_adaptive_incremental(saved_adaptive);
+  GC_set_full_freq(saved_frequency);
+  GC_set_time_limit(saved_time);
+  GC_printf("Tested foreign-write recovery and owner reprotection\n");
+}
 #  endif
 #endif
 
@@ -2662,6 +2722,7 @@ main(void)
   test_isolate_committed_ranges();
 #  if defined(LINUX) && !defined(GC_DISABLE_INCREMENTAL)
   test_isolate_mprotect_aging();
+  test_isolate_mprotect_foreign_write();
 #  endif
 #endif
   GC_set_min_bytes_allocd(1);

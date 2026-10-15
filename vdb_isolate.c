@@ -114,7 +114,13 @@ static size_t range_capacity = 0;
 /* Once foreign recovery has changed an owner's physical permissions,
    its private protection bitmap is no longer sufficient to skip RO
    syscalls.  Keep that optimization disabled for the process lifetime. */
-static GC_bool foreign_writes_seen = FALSE;
+/* Keep the before/after permission checks ordered without entering the
+   registry lock.  Fault recovery must never use an emulated atomic lock. */
+#  if defined(__ATOMIC_SEQ_CST) && defined(__GCC_ATOMIC_CHAR_LOCK_FREE) \
+      && __GCC_ATOMIC_CHAR_LOCK_FREE == 2
+#    define GC_ISOLATE_ATOMIC_FOREIGN_WRITES
+#  endif
+static unsigned char foreign_writes_seen = FALSE;
 
 static GC_isolate_mutex_t pending_lock = GC_ISOLATE_MUTEX_INITIALIZER;
 static ptr_t *pending_queue = NULL;
@@ -442,19 +448,27 @@ GC_isolate_vdb_committed_bounds(const void *addr, ptr_t *start, ptr_t *end)
 GC_INNER GC_bool
 GC_isolate_vdb_has_foreign_writes(void)
 {
+#  ifdef GC_ISOLATE_ATOMIC_FOREIGN_WRITES
+  return (GC_bool)__atomic_load_n(&foreign_writes_seen, __ATOMIC_SEQ_CST);
+#  else
   GC_bool result;
   GC_isolate_mutex_lock(&range_lock);
-  result = foreign_writes_seen;
+  result = (GC_bool)foreign_writes_seen;
   GC_isolate_mutex_unlock(&range_lock);
   return result;
+#  endif
 }
 
 GC_INNER GC_bool
 GC_isolate_vdb_push_pending(struct hblk *h, unsigned n)
 {
+#  ifdef GC_ISOLATE_ATOMIC_FOREIGN_WRITES
+  __atomic_store_n(&foreign_writes_seen, TRUE, __ATOMIC_SEQ_CST);
+#  else
   GC_isolate_mutex_lock(&range_lock);
   foreign_writes_seen = TRUE;
   GC_isolate_mutex_unlock(&range_lock);
+#  endif
   unsigned i;
   size_t missing = 0;
 
