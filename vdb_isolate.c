@@ -77,27 +77,25 @@ typedef pthread_mutex_t GC_isolate_mutex_t;
 #  endif
 
 /*
- * A single registry of disjoint address ranges covering exactly the
- * union of all heap sections any isolate has ever registered, each
- * tagged with whether it is currently committed (mprotect'd RW, i.e. a
- * live page some isolate can legitimately write to) or decommitted
- * (mprotect(PROT_NONE) + madvise(MADV_DONTNEED) by GC_unmap(), i.e. any
- * write there is a real bug). An address not covered by any range here
- * was never part of any isolate's heap at all.
+ * A sorted registry of the original, disjoint heap sections.  A bitmap
+ * records committed state per HBLKSIZE block; OS unmap/remap boundaries
+ * are multiples of HBLKSIZE.  Changing state never splits a registry
+ * entry or moves its tail.  An address outside these sections remains
+ * UNKNOWN, while a cleared bit identifies decommitted memory.
  *
  * GC_remap() is not guaranteed to be called with the exact same (start,
  * bytes) as the GC_unmap() that decommitted that memory -- blocks can
  * be split/merged in between (allchblk.c) -- so this is modeled as
  * proper interval state, not as a set of (un)commit events paired up by
  * matching address+length. GC_isolate_vdb_note_unmap()/_remap() mark an
- * arbitrary sub-range's committed state, splitting/merging existing
- * entries as needed, so a remap of different shape than the unmap that
+ * arbitrary block-aligned sub-range's committed state without changing
+ * section boundaries, so a remap of different shape than the unmap that
  * preceded it still lands on the correct final state everywhere.
  */
 typedef struct {
   ptr_t start;
   ptr_t end; /*< exclusive */
-  GC_bool committed;
+  unsigned char *committed;
 } GC_isolate_range;
 
 /* Marks a page dirty in the *calling* thread's own TLS bitmap, bypassing
@@ -111,7 +109,18 @@ GC_INNER void GC_isolate_dirty_page(const void *p);
 static GC_isolate_mutex_t range_lock = GC_ISOLATE_MUTEX_INITIALIZER;
 static GC_isolate_range *range_registry = NULL;
 static size_t range_count = 0;
+STATIC MAY_THREAD_LOCAL GC_bool isolate_has_registered_ranges = FALSE;
 static size_t range_capacity = 0;
+/* Once foreign recovery has changed an owner's physical permissions,
+   its private protection bitmap is no longer sufficient to skip RO
+   syscalls.  Keep that optimization disabled for the process lifetime. */
+/* Keep the before/after permission checks ordered without entering the
+   registry lock.  Fault recovery must never use an emulated atomic lock. */
+#  if defined(__ATOMIC_SEQ_CST) && defined(__GCC_ATOMIC_CHAR_LOCK_FREE) \
+      && __GCC_ATOMIC_CHAR_LOCK_FREE == 2
+#    define GC_ISOLATE_ATOMIC_FOREIGN_WRITES
+#  endif
+static unsigned char foreign_writes_seen = FALSE;
 
 static GC_isolate_mutex_t pending_lock = GC_ISOLATE_MUTEX_INITIALIZER;
 static ptr_t *pending_queue = NULL;
@@ -165,197 +174,183 @@ ensure_pending_capacity_locked(size_t needed)
   return TRUE;
 }
 
-static int
-compare_ranges(const void *a, const void *b)
+/* Both registries preserve address order at every mutation. */
+static size_t
+first_range_ending_after(ptr_t address)
 {
-  const GC_isolate_range *ra = (const GC_isolate_range *)a;
-  const GC_isolate_range *rb = (const GC_isolate_range *)b;
-  if (ra->start < rb->start) return -1;
-  if (ra->start > rb->start) return 1;
-  return 0;
-}
-
-/* Merges adjacent (in address, not necessarily in array position)
-   same-committed-state entries so range_count does not grow without
-   bound under repeated unmap/remap churn. Must be called with
-   range_lock held. O(n log n) sorting + O(n) single pass compaction. */
-static void
-coalesce_ranges_locked(void)
-{
-  if (range_count <= 1)
-    return;
-
-  qsort(range_registry, range_count, sizeof(GC_isolate_range), compare_ranges);
-
-  size_t write_idx = 0;
-  size_t i;
-  for (i = 1; i < range_count; i++) {
-    if (range_registry[write_idx].committed == range_registry[i].committed
-        && range_registry[write_idx].end == range_registry[i].start) {
-      range_registry[write_idx].end = range_registry[i].end;
-    } else {
-      write_idx++;
-      if (write_idx != i) {
-        range_registry[write_idx] = range_registry[i];
-      }
-    }
+  size_t low = 0, high = range_count;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (ADDR_GE(address, range_registry[mid].end))
+      low = mid + 1;
+    else
+      high = mid;
   }
-  range_count = write_idx + 1;
+  return low;
 }
 
-/*
- * Marks [start, end) as `committed` within the registry, splitting any
- * existing entry that only partially overlaps [start, end) so the
- * pre-existing state of the non-overlapping remainder is preserved.
- * Must be called with range_lock held.
- *
- * Entries appended mid-loop (the pieces produced by a split) always end
- * up either fully inside [start, end) -- already carrying the requested
- * `committed` value, so revisiting them later in the same pass is a
- * harmless no-op relabel -- or fully outside it, so they never overlap
- * on a later iteration either. Hence a single forward pass is enough
- * even though range_count changes underneath it.
- */
+static size_t
+first_range_starting_at_or_after(ptr_t address)
+{
+  size_t low = 0, high = range_count;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (ADDR_LT(range_registry[mid].start, address))
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  return low;
+}
+
+/* Sorted unique pending pages: no FIFO ordering is required. */
+static size_t
+first_pending_at_or_after(ptr_t address)
+{
+  size_t low = 0, high = pending_count;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (ADDR_LT(pending_queue[mid], address))
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  return low;
+}
+
+/* Update only registered blocks; gaps keep their UNKNOWN classification.
+   Must be called with range_lock held.  Metadata is allocated only when
+   registering a section, never while changing committed state. */
 static void
 mark_range_locked(ptr_t start, ptr_t end, GC_bool committed)
 {
-  size_t i;
+  size_t i = first_range_ending_after(start);
 
-  for (i = 0; i < range_count; i++) {
-    ptr_t rs = range_registry[i].start;
-    ptr_t re = range_registry[i].end;
-    GC_bool orig_committed = range_registry[i].committed;
+  for (; i < range_count && ADDR_LT(range_registry[i].start, end); ++i) {
+    GC_isolate_range *range = &range_registry[i];
+    ptr_t begin = ADDR_LT(start, range->start) ? range->start : start;
+    ptr_t stop = ADDR_LT(end, range->end) ? end : range->end;
+    size_t first = divHBLKSZ((size_t)(begin - range->start));
+    size_t last = divHBLKSZ((size_t)(stop - range->start));
 
-    if (re <= start || rs >= end)
-      continue; /*< no overlap */
-
-    if (rs < start && re > end) {
-      /* [start, end) strictly inside this entry: split into 3 pieces. */
-      if (!ensure_range_capacity_locked(2)) {
-        /* Out of memory to represent the split precisely. Relabeling
-           the whole entry to `committed` would be unsafe in the
-           decommit direction: part of [rs, re) could still be
-           genuinely unmapped, and a later cross-isolate write there
-           would then be let through as CROSS_ISOLATE instead of
-           aborting as DECOMMITTED. Drop the entry entirely instead --
-           addresses in [rs, re) then classify as UNKNOWN and fall back
-           to the pre-existing abort, which is always the safe
-           direction. */
-        range_registry[i] = range_registry[range_count - 1];
-        range_count--;
-        i--; /*< re-examine the entry swapped into this index */
-        continue;
-      }
-      range_registry[i].end = start; /*< left remainder: [rs, start) */
-      range_registry[range_count].start = start;
-      range_registry[range_count].end = end;
-      range_registry[range_count].committed = committed;
-      range_count++;
-      range_registry[range_count].start = end;
-      range_registry[range_count].end = re;
-      range_registry[range_count].committed = orig_committed;
-      range_count++;
-    } else if (rs < start) {
-      /* Overlap on this entry's right side: [start, re) is affected,
-         and (since not the strictly-inside case) re <= end holds. */
-      range_registry[i].end = start; /*< shrink to [rs, start) */
-      if (ensure_range_capacity_locked(1)) {
-        range_registry[range_count].start = start;
-        range_registry[range_count].end = re;
-        range_registry[range_count].committed = committed;
-        range_count++;
-      }
-    } else if (re > end) {
-      /* Overlap on this entry's left side: [rs, end) is affected, and
-         (since rs >= start here) rs >= start holds. */
-      range_registry[i].start = end; /*< shrink to [end, re) */
-      if (ensure_range_capacity_locked(1)) {
-        range_registry[range_count].start = rs;
-        range_registry[range_count].end = end;
-        range_registry[range_count].committed = committed;
-        range_count++;
-      }
-    } else {
-      /* This entry is fully inside [start, end): just relabel it. */
-      range_registry[i].committed = committed;
+    GC_ASSERT((size_t)(begin - range->start) % HBLKSIZE == 0);
+    GC_ASSERT((size_t)(stop - range->start) % HBLKSIZE == 0);
+    while (first < last && (first & 7) != 0) {
+      unsigned char mask = (unsigned char)(1U << (first & 7));
+      if (committed)
+        range->committed[first >> 3] |= mask;
+      else
+        range->committed[first >> 3] &= (unsigned char)~mask;
+      ++first;
+    }
+    if (last - first >= 8) {
+      size_t bytes = (last - first) / 8;
+      memset(range->committed + (first >> 3), committed ? 0xff : 0, bytes);
+      first += bytes * 8;
+    }
+    while (first < last) {
+      unsigned char mask = (unsigned char)(1U << (first & 7));
+      if (committed)
+        range->committed[first >> 3] |= mask;
+      else
+        range->committed[first >> 3] &= (unsigned char)~mask;
+      ++first;
     }
   }
 }
 
-/*
- * Removes [start, end) from the registry entirely. Same interval-overlap
- * cases as mark_range_locked() above, except the overlapping portion is
- * dropped rather than relabeled; see GC_isolate_vdb_deinit(), the only
- * caller. Must be called with range_lock held.
- */
+/* Remove an original heap section at isolate deinitialization.  Sections
+   retain their registration boundaries even after arbitrary remaps. */
 static void
 delete_range_locked(ptr_t start, ptr_t end)
 {
-  size_t i;
+  size_t index = first_range_ending_after(start);
 
-  for (i = 0; i < range_count; i++) {
-    ptr_t rs = range_registry[i].start;
-    ptr_t re = range_registry[i].end;
-
-    if (re <= start || rs >= end)
-      continue; /*< no overlap */
-
-    if (rs < start && re > end) {
-      /* [start, end) strictly inside this entry: keep both remainders. */
-      range_registry[i].end = start; /*< left remainder: [rs, start) */
-      if (ensure_range_capacity_locked(1)) {
-        range_registry[range_count].start = end;
-        range_registry[range_count].end = re;
-        range_registry[range_count].committed = range_registry[i].committed;
-        range_count++;
-      }
-      /* else: the right remainder [end, re) has to be dropped for lack
-         of memory; it then classifies as UNKNOWN, same as if it had
-         never been registered -- the safe (if imprecise) direction, as
-         in mark_range_locked(). */
-    } else if (rs < start) {
-      /* Overlap on this entry's right side: keep [rs, start) only. */
-      range_registry[i].end = start;
-    } else if (re > end) {
-      /* Overlap on this entry's left side: keep [end, re) only. */
-      range_registry[i].start = end;
-    } else {
-      /* This entry is fully inside [start, end): drop it. */
-      range_registry[i] = range_registry[range_count - 1];
-      range_count--;
-      i--; /*< re-examine the entry swapped into this index */
-    }
-  }
+  if (index == range_count || ADDR_GE(range_registry[index].start, end))
+    return;
+  GC_ASSERT(range_registry[index].start == start);
+  GC_ASSERT(range_registry[index].end == end);
+  free(range_registry[index].committed);
+  memmove(&range_registry[index], &range_registry[index + 1],
+          (range_count - index - 1) * sizeof(*range_registry));
+  --range_count;
 }
 
 GC_INNER void
 GC_isolate_vdb_register_heap_sect(ptr_t start, size_t bytes)
 {
-  /* Nothing to recover for a heap that is never write-protected in the
-     first place: MPROTECT_VDB only mprotect()s a thread's heap sections
-     while that thread's own incremental mode is on, so a cross-isolate
-     fault can never occur here unless GC_incremental was already TRUE
-     when this section was added. GC_incremental can only go from FALSE
-     to TRUE before this thread's own GC_init() completes and never
-     afterward (see GC_enable_incremental(), misc.c), so this check is
-     stable for the entire lifetime of this thread's GC instance -- no
-     section added while it read TRUE can later "lose" its registration
-     because incremental turned off, and no section added while it read
-     FALSE was ever actually mprotect'd. */
-  if (!GC_incremental)
+  /* Keep registered sections tracked even after a VMA-limit fallback
+     disables incremental mode.  Reserve their bitmap before publishing
+     the section, so allocation failure leaves its addresses UNKNOWN. */
+  if (!GC_incremental && !GC_incremental_start_pending)
     return;
   GC_isolate_mutex_lock(&range_lock);
-  if (ensure_range_capacity_locked(1)) {
-    range_registry[range_count].start = start;
-    range_registry[range_count].end = start + bytes;
-    range_registry[range_count].committed = TRUE;
-    range_count++;
-    coalesce_ranges_locked();
+  {
+    size_t index = first_range_starting_at_or_after(start);
+    size_t bitmap_bytes = (divHBLKSZ(bytes) + 7) / 8;
+    ptr_t end = start + bytes;
+    unsigned char *committed;
+
+    GC_ASSERT(bytes % HBLKSIZE == 0);
+    GC_ASSERT(index == 0 || ADDR_GE(start, range_registry[index - 1].end));
+    GC_ASSERT(index == range_count || ADDR_GE(range_registry[index].start, end));
+    committed = (unsigned char *)malloc(bitmap_bytes);
+    if (committed != NULL) {
+      if (ensure_range_capacity_locked(1)) {
+        memset(committed, 0xff, bitmap_bytes);
+        memmove(&range_registry[index + 1], &range_registry[index],
+                (range_count - index) * sizeof(*range_registry));
+        range_registry[index].start = start;
+        range_registry[index].end = end;
+        range_registry[index].committed = committed;
+        ++range_count;
+        isolate_has_registered_ranges = TRUE;
+      } else {
+        free(committed);
+      }
+    }
   }
-  /* else: out of memory. classify_fault() will report addresses in this
-     section as GC_ISOLATE_VDB_UNKNOWN, i.e. fall back to the
-     pre-existing abort behavior -- never a false "safe to ignore". */
   GC_isolate_mutex_unlock(&range_lock);
+}
+
+/* The caller holds range_lock and has checked the block is in range. */
+static GC_bool
+block_is_committed(const GC_isolate_range *range, size_t block)
+{
+  return (range->committed[block >> 3] & (1U << (block & 7))) != 0;
+}
+
+static size_t
+committed_begin(const GC_isolate_range *range, size_t block)
+{
+  while (block != 0) {
+    if ((block & 7) == 0 && range->committed[(block >> 3) - 1] == 0xff) {
+      block -= 8;
+    } else if (block_is_committed(range, block - 1)) {
+      --block;
+    } else {
+      break;
+    }
+  }
+  return block;
+}
+
+static size_t
+committed_end(const GC_isolate_range *range, size_t block)
+{
+  size_t blocks = divHBLKSZ((size_t)(range->end - range->start));
+
+  while (block < blocks) {
+    if ((block & 7) == 0 && blocks - block >= 8
+        && range->committed[block >> 3] == 0xff) {
+      block += 8;
+    } else if (block_is_committed(range, block)) {
+      ++block;
+    } else {
+      break;
+    }
+  }
+  return block;
 }
 
 GC_INNER void
@@ -364,22 +359,20 @@ GC_isolate_vdb_note_unmap(ptr_t start, size_t bytes)
   /* See the comment in GC_isolate_vdb_register_heap_sect(): a section
      never registered (because GC_incremental was off when it was added)
      has nothing to update here either. */
-  if (!GC_incremental || NULL == start || 0 == bytes)
+  if (!isolate_has_registered_ranges || NULL == start || 0 == bytes)
     return;
   GC_isolate_mutex_lock(&range_lock);
   mark_range_locked(start, start + bytes, FALSE);
-  coalesce_ranges_locked();
   GC_isolate_mutex_unlock(&range_lock);
 }
 
 GC_INNER void
 GC_isolate_vdb_note_remap(ptr_t start, size_t bytes)
 {
-  if (!GC_incremental || NULL == start || 0 == bytes)
+  if (!isolate_has_registered_ranges || NULL == start || 0 == bytes)
     return;
   GC_isolate_mutex_lock(&range_lock);
   mark_range_locked(start, start + bytes, TRUE);
-  coalesce_ranges_locked();
   GC_isolate_mutex_unlock(&range_lock);
 }
 
@@ -396,8 +389,10 @@ GC_isolate_vdb_classify_fault(const void *addr)
     while (low < high) {
       size_t mid = low + (high - low) / 2;
       if (a >= range_registry[mid].start && a < range_registry[mid].end) {
-        result = range_registry[mid].committed ? GC_ISOLATE_VDB_CROSS_ISOLATE
-                                             : GC_ISOLATE_VDB_DECOMMITTED;
+        size_t block = divHBLKSZ((size_t)(a - range_registry[mid].start));
+        result = block_is_committed(&range_registry[mid], block)
+                     ? GC_ISOLATE_VDB_CROSS_ISOLATE
+                     : GC_ISOLATE_VDB_DECOMMITTED;
         break;
       } else if (a < range_registry[mid].start) {
         high = mid;
@@ -411,25 +406,95 @@ GC_isolate_vdb_classify_fault(const void *addr)
 }
 
 GC_INNER GC_bool
+GC_isolate_vdb_committed_bounds(const void *addr, ptr_t *start, ptr_t *end)
+{
+  ptr_t a = (ptr_t)addr;
+  GC_bool found = FALSE;
+  size_t high;
+
+  GC_isolate_mutex_lock(&range_lock);
+  high = first_range_ending_after(a);
+  if (high < range_count && ADDR_GE(a, range_registry[high].start)) {
+    size_t block = divHBLKSZ((size_t)(a - range_registry[high].start));
+    if (block_is_committed(&range_registry[high], block)) {
+      const GC_isolate_range *range = &range_registry[high];
+      size_t first = committed_begin(range, block);
+      size_t last = committed_end(range, block + 1);
+      size_t index = high;
+
+      *start = range->start + first * HBLKSIZE;
+      *end = range->start + last * HBLKSIZE;
+      while (first == 0 && index > 0
+             && range_registry[index - 1].end == *start) {
+        range = &range_registry[--index];
+        first = committed_begin(
+            range, divHBLKSZ((size_t)(range->end - range->start)));
+        *start = range->start + first * HBLKSIZE;
+      }
+      index = high;
+      while (*end == range_registry[index].end && index + 1 < range_count
+             && range_registry[index + 1].start == *end) {
+        range = &range_registry[++index];
+        last = committed_end(range, 0);
+        *end = range->start + last * HBLKSIZE;
+      }
+      found = TRUE;
+    }
+  }
+  GC_isolate_mutex_unlock(&range_lock);
+  return found;
+}
+
+GC_INNER GC_bool
+GC_isolate_vdb_has_foreign_writes(void)
+{
+#  ifdef GC_ISOLATE_ATOMIC_FOREIGN_WRITES
+  return (GC_bool)__atomic_load_n(&foreign_writes_seen, __ATOMIC_SEQ_CST);
+#  else
+  GC_bool result;
+  GC_isolate_mutex_lock(&range_lock);
+  result = (GC_bool)foreign_writes_seen;
+  GC_isolate_mutex_unlock(&range_lock);
+  return result;
+#  endif
+}
+
+GC_INNER GC_bool
 GC_isolate_vdb_push_pending(struct hblk *h, unsigned n)
 {
   unsigned i;
+  size_t missing = 0;
 
+#  ifdef GC_ISOLATE_ATOMIC_FOREIGN_WRITES
+  __atomic_store_n(&foreign_writes_seen, TRUE, __ATOMIC_SEQ_CST);
+#  else
+  GC_isolate_mutex_lock(&range_lock);
+  foreign_writes_seen = TRUE;
+  GC_isolate_mutex_unlock(&range_lock);
+#  endif
   GC_isolate_mutex_lock(&pending_lock);
-  if (!ensure_pending_capacity_locked(n)) {
-    /* Out of memory: refuse the whole batch rather than drop part of
-       it. Silently dropping even one page here would mean the owning
-       isolate never marks it dirty and never rescans it, which can
-       let the collector free a still-live object (the write may have
-       stored a new pointer into an already-black object) -- letting
-       the write through unrecorded is unsound, not merely
-       "conservative". The caller must fall back to the ordinary abort
-       path instead of unprotecting the page. */
+  for (i = 0; i < n; ++i) {
+    ptr_t address = (ptr_t)(h + i);
+    size_t index = first_pending_at_or_after(address);
+    if (index == pending_count || pending_queue[index] != address)
+      ++missing;
+  }
+  /* Reserve the whole batch before changing the set.  Existing duplicate
+     pages are already durable; missing pages must never be dropped. */
+  if (!ensure_pending_capacity_locked(missing)) {
     GC_isolate_mutex_unlock(&pending_lock);
     return FALSE;
   }
-  for (i = 0; i < n; i++)
-    pending_queue[pending_count++] = (ptr_t)(h + i);
+  for (i = 0; i < n; ++i) {
+    ptr_t address = (ptr_t)(h + i);
+    size_t index = first_pending_at_or_after(address);
+    if (index < pending_count && pending_queue[index] == address)
+      continue;
+    memmove(&pending_queue[index + 1], &pending_queue[index],
+            (pending_count - index) * sizeof(*pending_queue));
+    pending_queue[index] = address;
+    ++pending_count;
+  }
   GC_isolate_mutex_unlock(&pending_lock);
   return TRUE;
 }
@@ -437,29 +502,32 @@ GC_isolate_vdb_push_pending(struct hblk *h, unsigned n)
 GC_INNER void
 GC_isolate_vdb_drain_pending(void)
 {
-  size_t i;
-
-  if (0 == pending_count)
-    return;
+  size_t section;
 
   GC_isolate_mutex_lock(&pending_lock);
-  i = 0;
-  while (i < pending_count) {
-    ptr_t addr = pending_queue[i];
-
-    /* GC_find_header() consults this thread's own TLS header table, so
-       a hit here means addr truly belongs to this isolate's heap. */
-    if (GC_find_header(addr) != NULL) {
-      GC_isolate_dirty_page(addr);
-      GC_COND_LOG_PRINTF(
-          "Claiming cross-isolate dirty page %p into this thread's own"
-          " dirty bitmap\n",
-          (void *)addr);
-      pending_queue[i] = pending_queue[pending_count - 1];
-      pending_count--;
-      /* Re-check the swapped-in entry at index i; do not advance. */
-    } else {
-      i++;
+  for (section = 0; section < GC_n_heap_sects && pending_count != 0; ++section) {
+    ptr_t start = GC_heap_sects[section].hs_start;
+    ptr_t end = start + GC_heap_sects[section].hs_bytes;
+    size_t first = first_pending_at_or_after(start);
+    size_t last = first_pending_at_or_after(end);
+    size_t read, write = first;
+    for (read = first; read < last; ++read) {
+      ptr_t address = pending_queue[read];
+      if (GC_find_header(address) != NULL) {
+#  if defined(LINUX)
+        GC_coarse_note_foreign_write(address, HBLKSIZE);
+#  endif
+        GC_isolate_dirty_page(address);
+        GC_COND_LOG_PRINTF("Claiming cross-isolate dirty page %p into this thread's own dirty bitmap\n",
+                           (void *)address);
+      } else {
+        pending_queue[write++] = address;
+      }
+    }
+    if (write != last) {
+      memmove(&pending_queue[write], &pending_queue[last],
+              (pending_count - last) * sizeof(*pending_queue));
+      pending_count -= last - write;
     }
   }
   GC_isolate_mutex_unlock(&pending_lock);
@@ -470,51 +538,29 @@ GC_isolate_vdb_deinit(void)
 {
   size_t i;
 
-  /* This thread never registered anything if its own incremental mode
-     was never on (see GC_isolate_vdb_register_heap_sect()); skip taking
-     the locks below for that common case. */
-  if (!GC_incremental)
+  if (!isolate_has_registered_ranges)
     return;
+  isolate_has_registered_ranges = FALSE;
 
   GC_isolate_mutex_lock(&range_lock);
   for (i = 0; i < GC_n_heap_sects; i++) {
     delete_range_locked(GC_heap_sects[i].hs_start,
                          GC_heap_sects[i].hs_start + GC_heap_sects[i].hs_bytes);
   }
-  coalesce_ranges_locked();
   GC_isolate_mutex_unlock(&range_lock);
 
-  if (0 == pending_count)
-    return;
-
-  /* Any pending page inside one of this thread's own heap sections can
-     only ever be claimed by this thread (GC_isolate_vdb_drain_pending()
-     relies on GC_find_header(), which consults this thread's own TLS
-     header table); once that table is gone, it would sit here forever.
-     Drop those entries now, while GC_heap_sects/GC_n_heap_sects (about to
-     be cleared by GC_deinit()) still identify them. */
+  /* Drop only this isolate's sorted pending ranges before its header
+     table disappears; other isolates retain their queued dirty pages. */
   GC_isolate_mutex_lock(&pending_lock);
-  i = 0;
-  while (i < pending_count) {
-    ptr_t addr = pending_queue[i];
-    size_t j;
-    GC_bool owned = FALSE;
-
-    for (j = 0; j < GC_n_heap_sects; j++) {
-      ptr_t hs_start = GC_heap_sects[j].hs_start;
-      ptr_t hs_end = hs_start + GC_heap_sects[j].hs_bytes;
-
-      if (addr >= hs_start && addr < hs_end) {
-        owned = TRUE;
-        break;
-      }
-    }
-    if (owned) {
-      pending_queue[i] = pending_queue[pending_count - 1];
-      pending_count--;
-      /* Re-check the swapped-in entry at index i; do not advance. */
-    } else {
-      i++;
+  for (i = 0; i < GC_n_heap_sects && pending_count != 0; ++i) {
+    ptr_t start = GC_heap_sects[i].hs_start;
+    ptr_t end = start + GC_heap_sects[i].hs_bytes;
+    size_t first = first_pending_at_or_after(start);
+    size_t last = first_pending_at_or_after(end);
+    if (first != last) {
+      memmove(&pending_queue[first], &pending_queue[last],
+              (pending_count - last) * sizeof(*pending_queue));
+      pending_count -= last - first;
     }
   }
   GC_isolate_mutex_unlock(&pending_lock);

@@ -412,6 +412,10 @@ setup_header(hdr *hhdr, struct hblk *block, size_t lb_adjusted, int kind,
       hhdr->hb_descr = 0;
       hhdr->hb_flags |= LARGE_BLOCK;
       hhdr->hb_map = NULL;
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+    && !defined(GC_DISABLE_INCREMENTAL)
+      GC_coarse_invalidate_eligibility();
+#endif
       return FALSE;
     }
 #  ifdef LINT2
@@ -426,6 +430,15 @@ setup_header(hdr *hhdr, struct hblk *block, size_t lb_adjusted, int kind,
   GC_clear_hdr_marks(hhdr);
 
   hhdr->hb_last_reclaimed = (unsigned short)GC_gc_no;
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+    && !defined(GC_DISABLE_INCREMENTAL)
+  GC_coarse_note_eligibility((ptr_t)block,
+                              OBJ_SZ_TO_BLOCKS(lb_adjusted) * HBLKSIZE,
+                              !IS_PTRFREE(hhdr));
+  GC_coarse_note_manual((ptr_t)block,
+                          OBJ_SZ_TO_BLOCKS(lb_adjusted) * HBLKSIZE,
+                          GC_kind_is_manual(kind));
+#endif
   return TRUE;
 }
 
@@ -926,7 +939,8 @@ GC_split_block(struct hblk *hbp, hdr *hhdr, struct hblk *last_hbp,
 
 STATIC struct hblk *GC_allochblk_nth(size_t lb_adjusted, int kind,
                                      unsigned flags, size_t index,
-                                     int may_split, size_t align_m1);
+                                     int may_split, size_t align_m1,
+                                     GC_bool mapped_only);
 
 #ifdef USE_MUNMAP
 #  define AVOID_SPLIT_REMAPPED 2
@@ -934,7 +948,8 @@ STATIC struct hblk *GC_allochblk_nth(size_t lb_adjusted, int kind,
 
 STATIC struct hblk *
 GC_allochblk_from_free_lists(size_t lb_adjusted, int kind, unsigned flags,
-                             size_t start_list, size_t align_m1)
+                             size_t start_list, size_t align_m1,
+                             GC_bool mapped_only)
 {
   struct hblk *result;
   int may_split = TRUE;
@@ -943,13 +958,14 @@ GC_allochblk_from_free_lists(size_t lb_adjusted, int kind, unsigned flags,
   /* Prefer an exact match, but use an already-free larger block before
    * deciding that a collection is needed. */
   result = GC_allochblk_nth(lb_adjusted, kind, flags, start_list, FALSE,
-                            align_m1);
+                            align_m1, mapped_only);
   if (result != NULL)
     return result;
 
   if (GC_use_entire_heap || GC_dont_gc
       || GC_heapsize - GC_large_free_bytes < GC_requested_heapsize
-      || GC_incremental || !GC_should_collect()) {
+      || (GC_incremental_collection && !GC_generational)
+      || !GC_should_collect_for_alloc()) {
     /* Should use more of the heap, even if it requires splitting. */
     split_limit = N_HBLK_FLS;
   } else if (GC_finalizer_bytes_freed > (GC_heapsize >> 4)) {
@@ -971,11 +987,28 @@ GC_allochblk_from_free_lists(size_t lb_adjusted, int kind, unsigned flags,
 
   for (; start_list <= split_limit; ++start_list) {
     result = GC_allochblk_nth(lb_adjusted, kind, flags, start_list, may_split,
-                              align_m1);
+                              align_m1, mapped_only);
     if (result != NULL)
       return result;
   }
   return NULL;
+}
+
+/* No collection, expansion, coalescing or remapping.  On success the
+   caller must initialize the allocated object before invoking any GC. */
+GC_INNER struct hblk *
+GC_try_mapped_allochblk(size_t lb_adjusted, int kind, unsigned flags,
+                        size_t align_m1)
+{
+  size_t blocks = OBJ_SZ_TO_BLOCKS_CHECKED(lb_adjusted);
+
+  GC_ASSERT(I_HOLD_LOCK());
+  if (UNLIKELY(SIZET_SAT_ADD(blocks * HBLKSIZE, align_m1)
+               >= (GC_SIZE_MAX >> 1)))
+    return NULL;
+  return GC_allochblk_from_free_lists(lb_adjusted, kind, flags,
+                                       GC_hblk_fl_from_blocks(blocks),
+                                       align_m1, TRUE);
 }
 
 GC_INNER struct hblk *
@@ -994,7 +1027,7 @@ GC_allochblk(size_t lb_adjusted, int kind,
 
   start_list = GC_hblk_fl_from_blocks(blocks);
   result = GC_allochblk_from_free_lists(lb_adjusted, kind, flags, start_list,
-                                        align_m1);
+                                        align_m1, FALSE);
   if (result != NULL)
     return result;
 
@@ -1002,13 +1035,15 @@ GC_allochblk(size_t lb_adjusted, int kind,
   if (GC_merge_free_blocks_for_alloc(
           (lb_adjusted + HBLKSIZE - 1) & ~(HBLKSIZE - 1), align_m1)) {
     result = GC_allochblk_from_free_lists(lb_adjusted, kind, flags, start_list,
-                                          align_m1);
+                                          align_m1, FALSE);
     if (result != NULL)
       return result;
   }
 #endif
 
   if (GC_should_collect_before_hblk_alloc()) {
+    if (GC_generational)
+      GC_COND_LOG_PRINTF("Generational schedule: full before block growth\n");
     /*
      * No suitable existing free block was found.  Collect before growing
      * the heap, then retry because the collection may have populated or
@@ -1016,7 +1051,7 @@ GC_allochblk(size_t lb_adjusted, int kind,
      */
     GC_gcollect_inner();
     return GC_allochblk_from_free_lists(lb_adjusted, kind, flags, start_list,
-                                        align_m1);
+                                        align_m1, FALSE);
   }
   return NULL;
 }
@@ -1026,7 +1061,7 @@ GC_allochblk(size_t lb_adjusted, int kind,
 
 static GC_bool
 next_hblk_fits_better(const hdr *hhdr, size_t size_avail, size_t size_needed,
-                      size_t align_m1)
+                      size_t align_m1, GC_bool mapped_only)
 {
   const hdr *nexthdr;
   size_t next_size;
@@ -1036,6 +1071,8 @@ next_hblk_fits_better(const hdr *hhdr, size_t size_avail, size_t size_needed,
   if (NULL == next_hbp)
     return FALSE; /*< no next block */
   GET_HDR(next_hbp, nexthdr);
+  if (mapped_only && !IS_MAPPED(nexthdr))
+    return FALSE;
   next_size = nexthdr->hb_sz;
   if (size_avail <= next_size)
     return FALSE; /*< not enough size */
@@ -1147,7 +1184,7 @@ is_hblks_mix_in_page(struct hblk *hbp, GC_bool is_ptrfree)
  */
 STATIC struct hblk *
 GC_allochblk_nth(size_t lb_adjusted, int kind, unsigned flags, size_t index,
-                 int may_split, size_t align_m1)
+                 int may_split, size_t align_m1, GC_bool mapped_only)
 {
   struct hblk *hbp, *last_hbp;
   /* The header corresponding to `hbp`. */
@@ -1170,6 +1207,8 @@ retry:
       return NULL;
 
     GET_HDR(hbp, hhdr); /*< set `hhdr` value */
+    if (mapped_only && !IS_MAPPED(hhdr))
+      continue;
     size_avail = hhdr->hb_sz;
     if (!may_split && size_avail != size_needed)
       continue;
@@ -1184,7 +1223,8 @@ retry:
        * This prevents us from disassembling a single large block to get
        * tiny blocks.
        */
-      if (next_hblk_fits_better(hhdr, size_avail, size_needed, align_m1))
+      if (next_hblk_fits_better(hhdr, size_avail, size_needed, align_m1,
+                                mapped_only))
         continue;
     }
 
@@ -1368,6 +1408,9 @@ GC_free_profiler_hook(void *p)
 GC_INNER void
 GC_freehblk(struct hblk *hbp)
 {
+  if (GC_young_mark_active && GC_young_sparse_sources)
+    GC_note_sparse_source_mutation();
+
   const struct hblk *next;
   struct hblk *prev;
   hdr *hhdr, *prevhdr, *nexthdr;
@@ -1402,6 +1445,11 @@ GC_freehblk(struct hblk *hbp)
 
   GC_ASSERT(IS_MAPPED(hhdr));
   hhdr->hb_flags |= FREE_BLK;
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+    && !defined(GC_DISABLE_INCREMENTAL)
+  GC_coarse_note_eligibility((ptr_t)hbp, size, TRUE);
+  GC_coarse_note_manual((ptr_t)hbp, size, FALSE);
+#endif
   next = (struct hblk *)((ptr_t)hbp + size);
   GET_HDR(next, nexthdr);
   prev = GC_free_block_ending_at(hbp);

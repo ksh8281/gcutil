@@ -113,7 +113,23 @@ typedef struct hce {
  *     phase push the contents of a free block.
  * A per-call cache needed neither, as it could not outlive a mark procedure.
  */
-#define GC_INVALIDATE_HDR_CACHE() BZERO(GC_hdr_cache, sizeof(GC_hdr_cache))
+GC_EXTERN MAY_THREAD_LOCAL word GC_target_table_stats[8];
+/* Eight census counters each for full and minor marking. */
+GC_EXTERN MAY_THREAD_LOCAL word GC_target_reuse_stats[16];
+#ifdef GC_TARGET_REUSE_CENSUS
+#  define GC_TARGET_REUSE_COUNT(n) \
+     (++GC_target_reuse_stats[(GC_young_mark_active ? 8 : 0) + (n)])
+#else
+#  define GC_TARGET_REUSE_COUNT(n) (void)0
+#endif
+#define GC_INVALIDATE_HDR_CACHE()                                 \
+  do {                                                           \
+    if (GC_target_mark_table != NULL) {                           \
+      GC_target_mark_table = NULL;                               \
+      ++GC_target_table_stats[2];                                 \
+    }                                                            \
+    BZERO(GC_hdr_cache, sizeof(GC_hdr_cache));                     \
+  } while (0)
 
 #define HCE(h) (hdr_cache + ((ADDR(h) >> LOG_HBLKSIZE) & (HDR_CACHE_SIZE - 1)))
 
@@ -154,6 +170,7 @@ GC_INNER hdr *GC_header_cache_miss(ptr_t p, hdr_cache_entry *hce);
       HC_HIT();                                    \
       hhdr = hce->hce_hdr;                         \
     } else {                                       \
+      GC_TARGET_REUSE_COUNT(7);                    \
       hhdr = HEADER_CACHE_MISS(p, hce, source);    \
       if (NULL == hhdr)                            \
         break; /*< go to the enclosing loop end */ \

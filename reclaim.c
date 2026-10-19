@@ -293,6 +293,10 @@ GC_reclaim_clear(struct hblk *hbp, const hdr *hhdr, size_t sz, ptr_t list,
       list = p;
       FREE_PROFILER_HOOK(p);
       p = GC_clear_block(p, sz, pcount);
+#ifdef VALGRIND_TRACKING
+      if (UNLIKELY(GC_young_mark_clear_invalidated))
+        break;
+#endif
     }
   }
   return list;
@@ -321,6 +325,10 @@ GC_reclaim_uninit(struct hblk *hbp, const hdr *hhdr, size_t sz, ptr_t list,
       obj_link(p) = list;
       list = p;
       FREE_PROFILER_HOOK(p);
+#ifdef VALGRIND_TRACKING
+      if (UNLIKELY(GC_young_mark_clear_invalidated))
+        break;
+#endif
     }
   }
   *pcount += n_bytes_found;
@@ -351,15 +359,27 @@ GC_disclaim_and_reclaim(struct hblk *hbp, hdr *hhdr, size_t sz, ptr_t list,
   for (bit_no = 0; ADDR_GE(plim, p); bit_no += MARK_BIT_OFFSET(sz)) {
     if (mark_bit_from_hdr(hhdr, bit_no)) {
       p += sz;
-    } else if (disclaim(p)) {
-      set_mark_bit_from_hdr(hhdr, bit_no);
-      INCR_MARKS(hhdr);
-      p += sz;
     } else {
+      int keep = disclaim(p);
+
+      /* A notifier can clear a later live cell's old mark.  Stop before
+         inspecting any more marks; the next full will repair the block. */
+      if (UNLIKELY(GC_young_mark_clear_invalidated))
+        break;
+      if (keep) {
+        set_mark_bit_from_hdr(hhdr, bit_no);
+        INCR_MARKS(hhdr);
+        p += sz;
+        continue;
+      }
       obj_link(p) = list;
       list = p;
       FREE_PROFILER_HOOK(p);
       p = GC_clear_block(p, sz, pcount);
+#  ifdef VALGRIND_TRACKING
+      if (UNLIKELY(GC_young_mark_clear_invalidated))
+        break;
+#  endif
     }
   }
   return list;
@@ -462,6 +482,8 @@ GC_reclaim_generic(struct hblk *hbp, hdr *hhdr, size_t sz, GC_bool init,
   GC_ASSERT(I_HOLD_LOCK());
 #endif
   GC_ASSERT(GC_find_header(hbp) == hhdr);
+  if (UNLIKELY(GC_young_mark_clear_invalidated))
+    return list;
 #ifndef GC_DISABLE_INCREMENTAL
   GC_remove_protection(hbp, 1, IS_PTRFREE_SAFE(hhdr));
 #endif
@@ -531,7 +553,7 @@ GC_disclaim_and_reclaim_or_free_small_block(struct hblk *hbp)
   hhdr->hb_last_reclaimed = (unsigned short)GC_gc_no;
   flh_next = GC_reclaim_generic(hbp, hhdr, sz, ok->ok_init, (ptr_t)(*flh),
                                 (/* unsigned */ word *)&GC_bytes_found);
-  if (hhdr->hb_n_marks) {
+  if (hhdr->hb_n_marks || GC_young_mark_clear_invalidated) {
     *flh = flh_next;
   } else {
     GC_ASSERT(hbp == hhdr->hb_block);
@@ -556,6 +578,8 @@ GC_reclaim_block(struct hblk *hbp, void *report_if_found)
   struct obj_kind *ok;
 
   GC_ASSERT(I_HOLD_LOCK());
+  if (UNLIKELY(GC_young_mark_clear_invalidated))
+    return;
 #if defined(CPPCHECK)
   GC_noop1_ptr(report_if_found);
 #endif
@@ -582,7 +606,11 @@ GC_reclaim_block(struct hblk *hbp, void *report_if_found)
       } else {
 #ifdef ENABLE_DISCLAIM
         if (UNLIKELY((hhdr->hb_flags & HAS_DISCLAIM) != 0)) {
-          if (ok->ok_disclaim_proc(hbp)) {
+          int keep = ok->ok_disclaim_proc(hbp);
+
+          if (UNLIKELY(GC_young_mark_clear_invalidated))
+            return;
+          if (keep) {
             /* Not disclaimed, thus resurrect the object. */
             set_mark_bit_from_hdr(hhdr, 0);
             goto in_use;
@@ -638,8 +666,11 @@ GC_reclaim_block(struct hblk *hbp, void *report_if_found)
 
       for (bit_no = 0; ADDR_GE(plim, p);
            bit_no += MARK_BIT_OFFSET(sz), p += sz) {
-        if (!mark_bit_from_hdr(hhdr, bit_no))
+        if (!mark_bit_from_hdr(hhdr, bit_no)) {
           FREE_PROFILER_HOOK(p);
+          if (UNLIKELY(GC_young_mark_clear_invalidated))
+            return;
+        }
       }
     }
 #endif
@@ -925,12 +956,94 @@ GC_clear_fl_links(void **flp)
   }
 }
 
+GC_INNER GC_bool
+GC_is_young_reclaim_candidate(const hdr *hhdr)
+{
+  struct hblk *page, *end;
+
+  if (!GC_young_reclaim_active || IS_PTRFREE_SAFE(hhdr)
+      || GC_obj_kinds[hhdr->hb_obj_kind].ok_eager_sweep
+#ifdef ENABLE_DISCLAIM
+      || (hhdr->hb_flags & HAS_DISCLAIM) != 0
+#endif
+  )
+    return TRUE;
+#ifndef GC_DISABLE_INCREMENTAL
+  page = hhdr->hb_block;
+  end = page + OBJ_SZ_TO_BLOCKS(hhdr->hb_sz);
+  for (; ADDR_LT((ptr_t)page, (ptr_t)end); ++page)
+    if (GC_page_was_dirty(page))
+      return TRUE;
+#else
+  UNUSED_ARG(page);
+  UNUSED_ARG(end);
+#endif
+  return FALSE;
+}
+
+GC_INNER MAY_THREAD_LOCAL word GC_young_sweeps = 0;
+GC_INNER MAY_THREAD_LOCAL word GC_old_blocks_preserved = 0;
+
+/* Keep cold old free cells linked. Only cells from blocks being reswept
+   have to be detached, including clearing their embedded descriptors. */
+STATIC void
+GC_detach_young_free_cells(void **flp, GC_bool clobber)
+{
+  void *cell = *flp;
+  const struct hblk *last_block = NULL;
+  GC_bool reclaim = TRUE;
+
+  while (cell != NULL) {
+    void *next = obj_link(cell);
+    struct hblk *block = HBLKPTR(cell);
+    if (block != last_block) {
+      last_block = block;
+      reclaim = GC_is_young_reclaim_candidate(HDR(block));
+    }
+    if (reclaim) {
+      *flp = next;
+      if (clobber)
+        obj_link(cell) = NULL;
+    } else {
+      flp = &obj_link(cell);
+    }
+    cell = next;
+  }
+}
+
+/* This first prototype still reads old block metadata for exact accounting.
+   It does not resweep old bodies or rebuild their lazy reclaim lists. */
+STATIC void GC_CALLBACK
+GC_reclaim_young_block(struct hblk *hbp, void *unused)
+{
+  hdr *hhdr = HDR(hbp);
+  size_t sz = hhdr->hb_sz;
+  word in_use;
+
+  UNUSED_ARG(unused);
+  if (GC_is_young_reclaim_candidate(hhdr)) {
+    GC_reclaim_block(hbp, NULL);
+    return;
+  }
+  ++GC_old_blocks_preserved;
+  in_use = sz > MAXOBJBYTES ? sz : (word)sz * hhdr->hb_n_marks;
+  if (IS_PTRFREE_SAFE(hhdr))
+    GC_atomic_in_use += in_use;
+  else
+    GC_composite_in_use += in_use;
+}
+
 GC_INNER void
 GC_start_reclaim(GC_bool report_if_found)
 {
   int kind;
+  GC_bool young_only = GC_young_reclaim_active && !GC_is_full_gc
+                       && !report_if_found && !GC_find_leak_inner
+                       && !GC_is_enumerate_reachable_objects;
 
   GC_ASSERT(I_HOLD_LOCK());
+  if (young_only)
+    ++GC_young_sweeps;
 #ifdef PARALLEL_MARK
   GC_ASSERT(0 == GC_fl_builder_count);
 #endif
@@ -956,23 +1069,44 @@ GC_start_reclaim(GC_bool report_if_found)
            ADDR_LT((ptr_t)fop, (ptr_t)lim); fop++) {
         if (*fop != NULL) {
           if (should_clobber) {
-            GC_clear_fl_links(fop);
+            if (young_only)
+              GC_detach_young_free_cells(fop, TRUE);
+            else
+              GC_clear_fl_links(fop);
           } else {
-            *fop = NULL;
+            if (young_only)
+              GC_detach_young_free_cells(fop, FALSE);
+            else
+              *fop = NULL;
           }
         }
       }
     } else {
       /* Free-list objects are marked, and it is safe to leave them. */
     }
-    BZERO(rlist, (MAXOBJGRANULES + 1) * sizeof(void *));
+    if (young_only) {
+      size_t granules;
+      for (granules = 0; granules <= MAXOBJGRANULES; ++granules) {
+        struct hblk **link = &rlist[granules];
+        while (*link != NULL) {
+          hdr *hhdr = HDR(*link);
+          if (GC_is_young_reclaim_candidate(hhdr))
+            *link = hhdr->hb_next;
+          else
+            link = &hhdr->hb_next;
+        }
+      }
+    } else {
+      BZERO(rlist, (MAXOBJGRANULES + 1) * sizeof(void *));
+    }
   }
 
   /*
    * Go through all heap blocks, and reclaim unmarked objects or enqueue
    * the block for later processing.
    */
-  GC_apply_to_all_blocks(GC_reclaim_block, NUMERIC_TO_VPTR(report_if_found));
+  GC_apply_to_all_blocks(young_only ? GC_reclaim_young_block : GC_reclaim_block,
+                         NUMERIC_TO_VPTR(report_if_found));
 
   if (UNLIKELY(GC_is_enumerate_reachable_objects))
       GC_reclaim_all((GC_stop_func)0, FALSE);
@@ -1003,6 +1137,11 @@ GC_continue_reclaim(size_t lg, int kind)
   void **flh;
 
   GC_ASSERT(I_HOLD_LOCK());
+  /* A public old-mark clear requires a full trace before lazy sweep.
+     Leave the list intact while collection is disabled; allocation may
+     still use existing free cells or whole blocks. */
+  if (UNLIKELY(GC_young_mark_clear_invalidated))
+    return;
   if (NULL == rlh) {
     /* No blocks of this kind. */
     return;
@@ -1014,11 +1153,69 @@ GC_continue_reclaim(size_t lg, int kind)
 
     *rlh = hhdr->hb_next;
     GC_reclaim_small_nonempty_block(hbp, hhdr->hb_sz, FALSE);
-    if (*flh != NULL) {
+    if (*flh != NULL || GC_young_mark_clear_invalidated) {
       /* The appropriate free list is nonempty. */
       break;
     }
   }
+}
+
+GC_INNER MAY_THREAD_LOCAL word GC_young_pending_kept;
+GC_INNER MAY_THREAD_LOCAL word GC_young_pending_drained;
+
+GC_INNER GC_bool
+GC_reclaim_before_young(void)
+{
+  struct hblk *pending = NULL;
+  int kind;
+  size_t lg;
+
+  GC_ASSERT(I_HOLD_LOCK());
+  /* Detach the work before invoking any disclaim/profiler callbacks.  A
+     callback can allocate from the preserved old lists and mutate them. */
+  for (kind = 0; kind < (int)GC_n_kinds; ++kind) {
+    struct hblk **rlp = GC_obj_kinds[kind].ok_reclaim_list;
+    if (rlp == NULL)
+      continue;
+    for (lg = 1; lg <= MAXOBJGRANULES; ++lg) {
+      struct hblk **link = rlp + lg;
+      while (*link != NULL) {
+        struct hblk *block = *link;
+        hdr *hhdr = HDR(block);
+        if (GC_young_pending_reclaim_safe(hhdr)) {
+          ++GC_young_pending_kept;
+          link = &hhdr->hb_next;
+        } else {
+          *link = hhdr->hb_next;
+          hhdr->hb_next = pending;
+          pending = block;
+        }
+      }
+    }
+  }
+  while (pending != NULL) {
+    struct hblk *block = pending;
+    hdr *hhdr = HDR(block);
+    pending = hhdr->hb_next;
+    GC_reclaim_small_nonempty_block(block, hhdr->hb_sz, FALSE);
+    ++GC_young_pending_drained;
+    if (GC_young_mark_clear_invalidated)
+      return FALSE;
+  }
+  /* Callbacks can set marks in a preserved block, or change the policy.
+     Recheck the final lists before any young marks are cleared. */
+  for (kind = 0; kind < (int)GC_n_kinds; ++kind) {
+    struct hblk **rlp = GC_obj_kinds[kind].ok_reclaim_list;
+    if (rlp == NULL)
+      continue;
+    for (lg = 1; lg <= MAXOBJGRANULES; ++lg) {
+      struct hblk *block;
+      for (block = rlp[lg]; block != NULL; block = HDR(block)->hb_next)
+        if (!GC_young_pending_reclaim_safe(HDR(block)))
+          return FALSE;
+    }
+  }
+  return TRUE;
 }
 
 GC_INNER GC_bool
@@ -1045,6 +1242,8 @@ GC_reclaim_all(GC_stop_func stop_func, GC_bool ignore_old)
 
     for (lg = 1; lg <= MAXOBJGRANULES; lg++) {
       for (rlh = rlp + lg; (hbp = *rlh) != NULL;) {
+        if (UNLIKELY(GC_young_mark_clear_invalidated))
+          return FALSE;
         if (stop_func != (GC_stop_func)0 && (*stop_func)()) {
           return FALSE;
         }
@@ -1103,6 +1302,8 @@ GC_reclaim_unconditionally_marked(void)
       while ((hbp = *rlh) != NULL) {
         const hdr *hhdr = HDR(hbp);
 
+        if (UNLIKELY(GC_young_mark_clear_invalidated))
+          return;
         *rlh = hhdr->hb_next;
         GC_reclaim_small_nonempty_block(hbp, hhdr->hb_sz, FALSE);
       }

@@ -2991,6 +2991,11 @@ block_unmap_inner(ptr_t start_addr, size_t len)
 {
   if (NULL == start_addr)
     return;
+#  if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+      && !defined(GC_DISABLE_INCREMENTAL)
+  GC_coarse_note_eligibility(start_addr, len, FALSE);
+  GC_coarse_note_manual(start_addr, len, FALSE);
+#  endif
 
 #  ifdef USE_WINALLOC
   /*
@@ -3103,6 +3108,11 @@ GC_remap(ptr_t start, size_t bytes)
     return;
   }
   GC_isolate_vdb_note_remap(start_addr, (size_t)(end_addr - start_addr));
+#  if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+      && !defined(GC_DISABLE_INCREMENTAL)
+  GC_coarse_note_eligibility(start_addr, (size_t)len, TRUE);
+  GC_coarse_note_manual(start_addr, (size_t)len, FALSE);
+#  endif
 
   /* FIXME: Handle out-of-memory correctly (at least for Win32). */
 #  ifdef USE_WINALLOC
@@ -3170,6 +3180,11 @@ GC_remap(ptr_t start, size_t bytes)
   }
   GC_ASSERT(GC_unmapped_bytes >= len);
   GC_unmapped_bytes -= len;
+#  endif
+#  if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB) \
+      && (defined(PREFER_MMAP_PROT_NONE) \
+          || defined(FORCE_MPROTECT_BEFORE_MADVISE))
+  GC_coarse_note_rw_remap(start_addr, (size_t)len);
 #  endif
 }
 
@@ -3656,6 +3671,626 @@ static MAY_THREAD_LOCAL DWORD protect_junk;
 #  define PROTECT(addr, len) MP_PROTECT_INNER(addr, len, FALSE)
 #  define UNPROTECT(addr, len) MP_PROTECT_INNER(addr, len, TRUE)
 
+#  if defined(LINUX) && defined(GC_THREAD_ISOLATE)
+#    define GC_COARSE_MPROTECT
+
+/* Exact permission state, separate from the colliding dirty-page hash.
+   Only this isolate protects its sections; foreign writes can make a
+   protected bit stale in the conservative (still protected) direction.
+   libc storage is never write protected.  Grow it outside fault handlers. */
+typedef struct {
+  word updated_gc_no;
+  unsigned char delay;
+  unsigned char backoff;
+  unsigned char protected_cycles;
+  unsigned char probed;
+} GC_coarse_page;
+
+typedef struct {
+  ptr_t start;
+  ptr_t end;
+  ptr_t owned_begin;
+  ptr_t owned_end;
+  word *protected_pages;
+  word *eligible_pages;
+  word *manual_pages;
+  GC_coarse_page *history;
+} GC_coarse_section;
+
+STATIC void GC_numeric_ro_deinit(void);
+STATIC MAY_THREAD_LOCAL word GC_manual_kind_bits[(MAXOBJKINDS + CPP_WORDSZ - 1) / CPP_WORDSZ];
+GC_INNER MAY_THREAD_LOCAL word GC_manual_kind_stats[8];
+
+STATIC MAY_THREAD_LOCAL GC_coarse_section *GC_coarse_sections;
+STATIC MAY_THREAD_LOCAL size_t GC_coarse_section_count;
+STATIC MAY_THREAD_LOCAL size_t GC_coarse_section_capacity;
+STATIC MAY_THREAD_LOCAL size_t GC_coarse_last_section;
+/* configured cap, short/long activity pages, shortened pending delays,
+   grace republished pages, write faults, exposed fault pages, protect calls,
+   requested protected pages, configured unprotect pages, applicable faults,
+   and applicable fault exposure pages. All counters are diagnostic only. */
+GC_INNER MAY_THREAD_LOCAL word GC_minor_grace_stats[12];
+STATIC MAY_THREAD_LOCAL size_t GC_coarse_unprotect_pages = 16;
+STATIC MAY_THREAD_LOCAL unsigned GC_minor_grace_cycles;
+STATIC MAY_THREAD_LOCAL unsigned GC_minor_grace_current;
+
+STATIC void
+GC_coarse_select_grace(void)
+{
+  GC_minor_grace_current
+      = GC_minor_grace_cycles != 0 && GC_minor_grace_is_applicable()
+            ? GC_minor_grace_cycles : 0;
+}
+
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_enabled;
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_free_protected;
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_exact_protection;
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_heap_writable;
+STATIC MAY_THREAD_LOCAL size_t GC_coarse_limit;
+STATIC MAY_THREAD_LOCAL word GC_coarse_age_gc_no;
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_eligibility_ready;
+#    if defined(GC_ASSERTIONS) || !defined(NDEBUG)
+STATIC MAY_THREAD_LOCAL GC_bool GC_coarse_eligibility_matches;
+STATIC MAY_THREAD_LOCAL word GC_coarse_expected_pages;
+#    endif
+
+STATIC void
+GC_coarse_discard_cache(void)
+{
+  size_t i;
+  for (i = 0; i < GC_coarse_section_count; ++i) {
+    free(GC_coarse_sections[i].protected_pages);
+    free(GC_coarse_sections[i].eligible_pages);
+    free(GC_coarse_sections[i].manual_pages);
+    free(GC_coarse_sections[i].history);
+  }
+  free(GC_coarse_sections);
+  GC_coarse_sections = NULL;
+  GC_coarse_section_count = GC_coarse_section_capacity
+      = GC_coarse_last_section = 0;
+  GC_coarse_enabled = FALSE;
+  GC_coarse_heap_writable = FALSE;
+  GC_coarse_eligibility_ready = FALSE;
+}
+
+GC_INNER void
+GC_coarse_protection_deinit(void)
+{
+  GC_coarse_discard_cache();
+  GC_numeric_ro_deinit();
+  BZERO(GC_manual_kind_bits, sizeof(GC_manual_kind_bits));
+  BZERO(GC_manual_kind_stats, sizeof(GC_manual_kind_stats));
+  GC_coarse_free_protected = FALSE;
+}
+
+STATIC void
+GC_coarse_sync_sections(void)
+{
+  size_t i, old_count = GC_coarse_section_count;
+  GC_coarse_section *sections;
+
+  if (!GC_coarse_enabled || old_count == GC_n_heap_sects)
+    return;
+  GC_ASSERT(old_count < GC_n_heap_sects);
+  GC_coarse_eligibility_ready = FALSE;
+  sections = GC_coarse_sections;
+  if (GC_n_heap_sects > GC_coarse_section_capacity) {
+    size_t capacity = GC_coarse_section_capacity != 0
+                          ? GC_coarse_section_capacity : 16;
+    if (GC_n_heap_sects > GC_SIZE_MAX / sizeof(*sections)) {
+      GC_coarse_discard_cache();
+      return;
+    }
+    while (capacity < GC_n_heap_sects) {
+      if (capacity > GC_SIZE_MAX / 2 / sizeof(*sections)) {
+        capacity = GC_n_heap_sects;
+        break;
+      }
+      capacity *= 2;
+    }
+    sections = (GC_coarse_section *)realloc(
+        sections, capacity * sizeof(*sections));
+    if (sections == NULL) {
+      GC_coarse_discard_cache();
+      return;
+    }
+    GC_coarse_sections = sections;
+    GC_coarse_section_capacity = capacity;
+  }
+  BZERO(sections + old_count,
+        (GC_n_heap_sects - old_count) * sizeof(*sections));
+  GC_coarse_section_count = GC_n_heap_sects;
+  for (i = old_count; i < GC_n_heap_sects; ++i) {
+    size_t pages = GC_heap_sects[i].hs_bytes / GC_page_size;
+    sections[i].start = GC_heap_sects[i].hs_start;
+    sections[i].end = sections[i].start + GC_heap_sects[i].hs_bytes;
+    sections[i].protected_pages = (word *)calloc(
+        divWORDSZ(pages + CPP_WORDSZ - 1), sizeof(word));
+    sections[i].eligible_pages = (word *)calloc(
+        divWORDSZ(pages + CPP_WORDSZ - 1), sizeof(word));
+    sections[i].manual_pages = (word *)calloc(
+        divWORDSZ(pages + CPP_WORDSZ - 1), sizeof(word));
+    sections[i].history = (GC_coarse_page *)calloc(pages, sizeof(GC_coarse_page));
+    if (sections[i].protected_pages == NULL || sections[i].history == NULL
+        || sections[i].eligible_pages == NULL
+        || sections[i].manual_pages == NULL) {
+      GC_coarse_discard_cache();
+      return;
+    }
+    /* Zero history is already idle and writable.  Stamp pages only when
+       their history is first used; atomic pages may never need it. */
+    if (i != 0 && ADDR_LT(sections[i].start, sections[i - 1].start)) {
+      GC_coarse_section added = sections[i];
+      size_t low = 0, high = i;
+      while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (ADDR_LT(sections[mid].start, added.start))
+          low = mid + 1;
+        else
+          high = mid;
+      }
+      memmove(sections + low + 1, sections + low,
+              (i - low) * sizeof(*sections));
+      sections[low] = added;
+    }
+  }
+  for (i = 0; i < GC_coarse_section_count;) {
+    size_t first = i, last = i + 1;
+    while (last < GC_coarse_section_count
+           && sections[last - 1].end == sections[last].start)
+      ++last;
+    for (; i < last; ++i) {
+      sections[i].owned_begin = sections[first].start;
+      sections[i].owned_end = sections[last - 1].end;
+    }
+  }
+  GC_coarse_last_section = 0;
+}
+
+/* First section whose end exceeds address, including an overlap that
+   starts in a gap.  The cache serves ordinary single-section faults;
+   binary search bounds the cost for scattered writes and long hints. */
+static size_t
+GC_coarse_first_section(ptr_t address)
+{
+  size_t low = 0, high = GC_coarse_section_count;
+  GC_coarse_section *section;
+
+  if (high == 0)
+    return 0;
+  section = &GC_coarse_sections[GC_coarse_last_section];
+  if (ADDR_GE(address, section->start) && ADDR_LT(address, section->end))
+    return GC_coarse_last_section;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (ADDR_GE(address, GC_coarse_sections[mid].end))
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  if (low < GC_coarse_section_count)
+    GC_coarse_last_section = low;
+  return low;
+}
+
+static GC_coarse_section *
+GC_coarse_find_section(ptr_t address)
+{
+  size_t index = GC_coarse_first_section(address);
+  if (index == GC_coarse_section_count
+      || ADDR_LT(address, GC_coarse_sections[index].start))
+    return NULL;
+  return &GC_coarse_sections[index];
+}
+
+STATIC word
+GC_coarse_page_mask(size_t first, size_t count)
+{
+  GC_ASSERT(count != 0 && count <= CPP_WORDSZ - modWORDSZ(first));
+  return (GC_WORD_MAX >> (CPP_WORDSZ - count)) << modWORDSZ(first);
+}
+
+STATIC unsigned
+GC_coarse_trailing_zeroes(word bits)
+{
+#    if defined(__GNUC__) || defined(__clang__)
+  return (unsigned)__builtin_ctzl((unsigned long)bits);
+#    else
+  unsigned count = 0;
+  while ((bits & 1) == 0) {
+    bits >>= 1;
+    ++count;
+  }
+  return count;
+#    endif
+}
+
+GC_INNER void
+GC_coarse_invalidate_eligibility(void)
+{
+  GC_coarse_eligibility_ready = FALSE;
+}
+
+/* No allocation and no header lookup on the allocation/free hot paths.
+   A new section invalidates the cache until the next complete rebuild. */
+GC_INNER void
+GC_coarse_note_eligibility(ptr_t start, size_t bytes, GC_bool eligible)
+{
+  ptr_t end = start + bytes;
+  if (!GC_coarse_enabled || !GC_coarse_eligibility_ready)
+    return;
+  if (GC_coarse_section_count != GC_n_heap_sects) {
+    GC_coarse_eligibility_ready = FALSE;
+    return;
+  }
+  while (ADDR_LT(start, end)) {
+    GC_coarse_section *section = GC_coarse_find_section(start);
+    ptr_t stop;
+    size_t first, last;
+    if (section == NULL) {
+      GC_coarse_eligibility_ready = FALSE;
+      return;
+    }
+    stop = ADDR_LT(end, section->end) ? end : section->end;
+    first = (size_t)(start - section->start) / HBLKSIZE;
+    last = (size_t)(stop - section->start) / HBLKSIZE;
+    while (first < last) {
+      unsigned shift = (unsigned)modWORDSZ(first);
+      size_t count = CPP_WORDSZ - shift;
+      word mask;
+      if (count > last - first)
+        count = last - first;
+      mask = (GC_WORD_MAX >> (CPP_WORDSZ - count)) << shift;
+      if (eligible)
+        section->eligible_pages[divWORDSZ(first)] |= mask;
+      else
+        section->eligible_pages[divWORDSZ(first)] &= ~mask;
+      first += count;
+    }
+    start = stop;
+  }
+}
+
+GC_INNER void
+GC_coarse_note_manual(ptr_t start, size_t bytes, GC_bool manual)
+{
+  ptr_t end = start + bytes;
+  if (!GC_coarse_enabled || !GC_coarse_eligibility_ready)
+    return;
+  if (GC_coarse_section_count != GC_n_heap_sects) {
+    GC_coarse_eligibility_ready = FALSE;
+    return;
+  }
+  while (ADDR_LT(start, end)) {
+    GC_coarse_section *section = GC_coarse_find_section(start);
+    ptr_t stop;
+    size_t first, last;
+    if (section == NULL) {
+      GC_coarse_eligibility_ready = FALSE;
+      return;
+    }
+    stop = ADDR_LT(end, section->end) ? end : section->end;
+    first = (size_t)(start - section->start) / HBLKSIZE;
+    last = (size_t)(stop - section->start) / HBLKSIZE;
+    while (first < last) {
+      size_t count = CPP_WORDSZ - modWORDSZ(first);
+      word mask;
+      if (count > last - first)
+        count = last - first;
+      mask = GC_coarse_page_mask(first, count);
+      if (manual)
+        section->manual_pages[divWORDSZ(first)] |= mask;
+      else
+        section->manual_pages[divWORDSZ(first)] &= ~mask;
+      first += count;
+    }
+    start = stop;
+  }
+}
+
+STATIC void
+GC_coarse_age_page(GC_coarse_section *section, size_t page, word gc_no)
+{
+  GC_coarse_page *state = &section->history[page];
+  word elapsed = gc_no - state->updated_gc_no;
+  if (GC_minor_grace_current != 0
+      && state->delay > GC_minor_grace_current) {
+    state->delay = (unsigned char)GC_minor_grace_current;
+    ++GC_minor_grace_stats[3];
+  }
+  if (elapsed == 0)
+    return;
+  if (elapsed > 32)
+    elapsed = 32;
+  state->updated_gc_no = gc_no;
+  state->delay = state->delay > elapsed
+                     ? (unsigned char)(state->delay - elapsed) : 0;
+  if ((section->protected_pages[divWORDSZ(page)]
+       & ((word)1 << modWORDSZ(page))) != 0) {
+    word age = (word)state->protected_cycles + elapsed;
+    state->protected_cycles = (unsigned char)(age < 2 ? age : 2);
+    if (age >= 2)
+      state->backoff = 0;
+  } else {
+    state->protected_cycles = 0;
+  }
+}
+
+STATIC void
+GC_coarse_advance_age(word gc_no)
+{
+  size_t i;
+  word previous = GC_coarse_age_gc_no;
+  GC_coarse_select_grace();
+  if (!GC_coarse_enabled || previous == gc_no)
+    return;
+  GC_coarse_age_gc_no = gc_no;
+  /* Ordinary passes age only the pages whose state they inspect.  On a
+     counter wrap, settle all older history before the new epoch records
+     writes: an untouched timestamp could otherwise alias this GC. */
+  if (gc_no > previous)
+    return;
+  for (i = 0; i < GC_coarse_section_count; ++i) {
+    GC_coarse_section *section = &GC_coarse_sections[i];
+    size_t page, pages = (size_t)(section->end - section->start) / GC_page_size;
+    for (page = 0; page < pages; ++page) {
+      if (section->history[page].updated_gc_no == gc_no)
+        section->history[page].updated_gc_no = gc_no - 32;
+      GC_coarse_age_page(section, page, gc_no);
+    }
+  }
+}
+
+/* Record only the requested write, not the unwritten neighbours that a
+   batched syscall makes writable.  Writes during an unprotected delay
+   are not observable; a later successful protection arms a fresh probe. */
+STATIC void
+GC_coarse_note_activity(ptr_t start, size_t bytes, GC_bool fault,
+                        GC_bool foreign)
+{
+  ptr_t end = start + bytes;
+  size_t i;
+  word gc_no = GC_gc_no;
+  if (!GC_coarse_enabled || GC_manual_vdb || IS_NON_MPROTECT_VDB())
+    return;
+  GC_coarse_advance_age(gc_no);
+  for (i = GC_coarse_first_section(start);
+       i < GC_coarse_section_count; ++i) {
+    GC_coarse_section *section = &GC_coarse_sections[i];
+    ptr_t first, last;
+    size_t page, limit;
+    if (ADDR_GE(section->start, end))
+      break;
+    first = ADDR_LT(start, section->start) ? section->start : start;
+    last = ADDR_LT(end, section->end) ? end : section->end;
+    page = (size_t)(first - section->start) / GC_page_size;
+    limit = (size_t)(last - section->start) / GC_page_size;
+    for (; page < limit; ++page) {
+      GC_coarse_page *state = &section->history[page];
+      unsigned hold = 16;
+      GC_coarse_age_page(section, page, gc_no);
+      if (fault) {
+        if (state->probed) {
+          if (foreign || state->protected_cycles <= 1) {
+            if (state->backoff < 5)
+              ++state->backoff;
+          } else {
+            state->backoff = 1;
+          }
+        }
+        hold = 1U << (state->backoff > 3 ? state->backoff : 4);
+      }
+      if (GC_minor_grace_current != 0) {
+        hold = GC_minor_grace_current;
+        ++GC_minor_grace_stats[1];
+      } else {
+        ++GC_minor_grace_stats[2];
+      }
+      if (state->delay < hold)
+        state->delay = (unsigned char)hold;
+      state->protected_cycles = state->probed = 0;
+    }
+  }
+}
+
+/* Set or clear exact physical protection bits.  Missing sections remain
+   unknown and use the original unprotection path until the next pass. */
+STATIC void
+GC_coarse_record_protection(ptr_t start, size_t len, GC_bool protected)
+{
+  ptr_t end = start + len;
+  size_t low = GC_coarse_first_section(start);
+  word gc_no = GC_gc_no;
+  GC_coarse_advance_age(gc_no);
+  while (ADDR_LT(start, end)) {
+    GC_coarse_section *section;
+    ptr_t stop;
+    size_t first, last;
+    if (low == GC_coarse_section_count)
+      return;
+    section = &GC_coarse_sections[low++];
+    if (ADDR_GE(section->start, end))
+      return;
+    if (ADDR_LT(start, section->start))
+      start = section->start;
+    stop = ADDR_LT(end, section->end) ? end : section->end;
+    first = (size_t)(start - section->start) / GC_page_size;
+    last = (size_t)(stop - section->start) / GC_page_size;
+    while (first < last) {
+      size_t index = divWORDSZ(first);
+      size_t count = CPP_WORDSZ - modWORDSZ(first);
+      word mask, changed;
+      if (count > last - first)
+        count = last - first;
+      mask = GC_coarse_page_mask(first, count);
+      /* Only newly protected pages need history updates.  Unprotection
+         retains the existing reset for every page in a writable batch. */
+      changed = protected ? ~section->protected_pages[index] & mask : mask;
+      while (changed != 0) {
+        size_t page = index * CPP_WORDSZ + GC_coarse_trailing_zeroes(changed);
+        GC_coarse_page *state = &section->history[page];
+        GC_coarse_age_page(section, page, gc_no);
+        /* A batched unprotect dirties every exposed page, but only an
+           observed fault/write hint earns a long generational grace.
+           Unwritten neighbours can be protected at the next snapshot. */
+        if (!GC_generational && !protected && state->delay < 16)
+          state->delay = 16;
+        state->protected_cycles = 0;
+        state->probed = protected ? 1 : 0;
+        changed &= changed - 1;
+      }
+      if (protected)
+        section->protected_pages[index] |= mask;
+      else
+        section->protected_pages[index] &= ~mask;
+      first += count;
+    }
+    start = stop;
+  }
+}
+
+GC_INNER void
+GC_coarse_note_rw_remap(ptr_t start, size_t bytes)
+{
+  if (GC_coarse_enabled)
+    GC_coarse_record_protection(start, bytes, FALSE);
+}
+
+GC_INNER void
+GC_coarse_note_foreign_write(ptr_t start, size_t bytes)
+{
+  if (GC_coarse_enabled) {
+    GC_coarse_note_activity(start, bytes, TRUE, TRUE);
+    GC_coarse_record_protection(start, bytes, FALSE);
+  }
+}
+
+static GC_bool
+GC_coarse_has_permission(ptr_t start, size_t len, GC_bool protected)
+{
+  ptr_t end = start + len;
+  while (ADDR_LT(start, end)) {
+    GC_coarse_section *section = GC_coarse_find_section(start);
+    ptr_t stop;
+    size_t first, last;
+    if (section == NULL)
+      return TRUE; /* Unknown permission state must never suppress a syscall. */
+    stop = ADDR_LT(end, section->end) ? end : section->end;
+    first = (size_t)(start - section->start) / GC_page_size;
+    last = (size_t)(stop - section->start) / GC_page_size;
+    while (first < last) {
+      size_t count = CPP_WORDSZ - modWORDSZ(first);
+      word bits = section->protected_pages[divWORDSZ(first)];
+      if (count > last - first)
+        count = last - first;
+      if (((protected ? bits : ~bits)
+           & GC_coarse_page_mask(first, count)) != 0)
+        return TRUE;
+      first += count;
+    }
+    start = stop;
+  }
+  return FALSE;
+}
+
+/* Expand within a bounded owned, committed write chunk.  mprotect can
+   change a prefix before failing, so dirty the complete attempted range
+   first, retain conservative permission bits on failure, and retry with
+   successively smaller page-aligned chunks. */
+static GC_bool
+GC_coarse_unprotect(ptr_t start, size_t len, GC_bool write_fault)
+{
+  GC_coarse_section *section;
+  ptr_t begin = start, end = start + len;
+#    if defined(PREFER_MMAP_PROT_NONE) \
+        || defined(FORCE_MPROTECT_BEFORE_MADVISE)
+  ptr_t committed_begin, committed_end;
+#    endif
+  struct hblk *page;
+  int saved_errno;
+  GC_bool minor_interval;
+
+  if (!GC_coarse_enabled || GC_manual_vdb || IS_NON_MPROTECT_VDB())
+    return FALSE;
+  section = GC_coarse_find_section(start);
+  if (section == NULL)
+    return FALSE;
+  if (write_fault)
+    GC_coarse_note_activity(start, len, TRUE, FALSE);
+  if (!write_fault && !GC_coarse_has_permission(start, len, TRUE)) {
+    return TRUE;
+  }
+  minor_interval = GC_minor_grace_is_applicable();
+  saved_errno = errno;
+  if (ADDR_GE(section->owned_end, end)
+#    if defined(PREFER_MMAP_PROT_NONE) \
+        || defined(FORCE_MPROTECT_BEFORE_MADVISE)
+      && GC_isolate_vdb_committed_bounds(start, &committed_begin,
+                                        &committed_end)
+      && ADDR_GE(committed_end, end)
+#    endif
+  ) {
+#    if defined(PREFER_MMAP_PROT_NONE) \
+        || defined(FORCE_MPROTECT_BEFORE_MADVISE)
+    begin = ADDR_LT(committed_begin, section->owned_begin)
+                ? section->owned_begin : committed_begin;
+    end = ADDR_LT(section->owned_end, committed_end)
+              ? section->owned_end : committed_end;
+#    else
+    /* Linux madvise-only decommit retains the mapping and its access
+       permissions.  Changing permissions across those free pages does
+       not recommit or touch them; adjacent owned sections can be one
+       syscall.  PROT_NONE decommit must stay inside committed bounds. */
+    begin = section->owned_begin;
+    end = section->owned_end;
+#    endif
+    {
+      size_t batch = (minor_interval ? GC_coarse_unprotect_pages : 16)
+                     * (size_t)GC_page_size;
+      if (batch > GC_coarse_limit)
+        batch = GC_coarse_limit;
+      if ((size_t)(end - begin) > batch) {
+        size_t offset = (size_t)(start - begin);
+        begin += offset / batch * batch;
+        if ((size_t)(end - begin) > batch)
+          end = begin + batch;
+        if (ADDR_LT(end, start + len)) {
+          begin = start;
+          end = start + len;
+        }
+      }
+    }
+  }
+  if (write_fault) {
+    ++GC_minor_grace_stats[5];
+    GC_minor_grace_stats[6] += (size_t)(end - begin) / GC_page_size;
+    if (minor_interval) {
+      ++GC_minor_grace_stats[10];
+      GC_minor_grace_stats[11] += (size_t)(end - begin) / GC_page_size;
+    }
+  }
+  for (page = (struct hblk *)begin; ADDR_LT((ptr_t)page, end); ++page)
+    async_set_pht_entry_from_index(GC_dirty_pages, PHT_HASH(page));
+  while (ADDR_LT(begin, end)) {
+    size_t bytes = (size_t)(end - begin);
+    if (bytes > GC_coarse_limit)
+      bytes = GC_coarse_limit;
+
+    if (mprotect(begin, bytes, PROT_READ | PROT_WRITE
+                                  | (GC_pages_executable ? PROT_EXEC : 0)) == 0) {
+      GC_coarse_record_protection(begin, bytes, FALSE);
+      begin += bytes;
+    } else if (bytes > GC_page_size) {
+      GC_coarse_limit = (bytes / 2) & ~(GC_page_size - 1);
+    } else {
+      ABORT_ON_REMAP_FAIL("coarse mprotect vdb", begin, bytes);
+    }
+  }
+  errno = saved_errno;
+  return TRUE;
+}
+#  endif /* LINUX && GC_THREAD_ISOLATE */
+
 #  if defined(MSWIN32)
 typedef LPTOP_LEVEL_EXCEPTION_FILTER SIG_HNDLR_PTR;
 #    undef SIG_DFL
@@ -3733,6 +4368,7 @@ is_header_found_async(const void *p)
 #    define GC_write_fault_this_thread_inited GC_is_initialized
 #  endif
 
+
 #  ifndef DARWIN
 
 #    if !defined(MSWIN32) && !defined(MSWINCE)
@@ -3783,6 +4419,7 @@ is_header_found_async(const void *p)
 #      ifndef NO_GETCONTEXT
 #        include <ucontext.h>
 #      endif
+#include "numeric-ro.inc"
 STATIC void
 GC_write_fault_handler(int sig, siginfo_t *si, void *raw_sc)
 #    else /* MSWIN32 || MSWINCE */
@@ -3915,7 +4552,17 @@ GC_write_fault_handler(struct _EXCEPTION_POINTERS *exc_info)
 #    endif
       }
     }
-    MP_PROTECT_INNER(h, GC_page_size, TRUE); /*< unprotect */
+#    ifdef GC_COARSE_MPROTECT
+    if (GC_try_numeric_ro(addr, raw_sc))
+      return;
+    if (!GC_coarse_unprotect((ptr_t)h, GC_page_size, TRUE))
+#    endif
+    {
+      MP_PROTECT_INNER(h, GC_page_size, TRUE); /*< unprotect */
+#    ifdef GC_COARSE_MPROTECT
+      GC_coarse_note_rw_remap((ptr_t)h, GC_page_size);
+#    endif
+    }
     /*
      * We need to make sure that no collection occurs between the
      * unprotect action and the setting of the dirty bit.
@@ -3973,6 +4620,31 @@ GC_dirty_init(void)
 #    endif
 
   GC_ASSERT(I_HOLD_LOCK());
+#    ifdef GC_COARSE_MPROTECT
+  GC_coarse_discard_cache();
+  GC_coarse_enabled = GC_page_size == HBLKSIZE;
+  GC_numeric_ro_init();
+  GC_coarse_limit = (size_t)GC_WORD_MAX;
+  GC_minor_grace_cycles = 0;
+  GC_minor_grace_current = 0;
+  {
+    const char *setting = GETENV("GC_BENCH_MINOR_GRACE_CYCLES");
+    int cycles = setting != NULL ? atoi(setting) : 0;
+    if (cycles == 1 || cycles == 2 || cycles == 4)
+      GC_minor_grace_cycles = (unsigned)cycles;
+    GC_minor_grace_stats[0] = GC_minor_grace_cycles;
+  }
+  GC_coarse_unprotect_pages = 16;
+  {
+    const char *setting = GETENV("GC_BENCH_FAULT_BATCH_PAGES");
+    int pages = setting != NULL ? atoi(setting) : 16;
+    if (pages == 1 || pages == 4 || pages == 16)
+      GC_coarse_unprotect_pages = (size_t)pages;
+    GC_minor_grace_stats[9] = GC_coarse_unprotect_pages;
+  }
+  GC_coarse_exact_protection = TRUE;
+  GC_coarse_age_gc_no = GC_gc_no;
+#    endif
 #    ifdef COUNT_PROTECTED_REGIONS
   GC_ASSERT(GC_page_size != 0);
   if ((GC_signed_word)(GC_heapsize / (word)GC_page_size)
@@ -4098,7 +4770,7 @@ GC_dirty_init(void)
 #  endif /* !DARWIN */
 
 #  if defined(CAN_HANDLE_FORK) && defined(DARWIN) && defined(THREADS) \
-      || defined(COUNT_PROTECTED_REGIONS)
+      || defined(COUNT_PROTECTED_REGIONS) || defined(GC_COARSE_MPROTECT)
 /* Remove protection for the entire heap not updating `GC_dirty_pages`. */
 STATIC void
 GC_unprotect_all_heap(void)
@@ -4110,7 +4782,14 @@ GC_unprotect_all_heap(void)
   for (i = 0; i < GC_n_heap_sects; i++) {
     MP_PROTECT_INNER(GC_heap_sects[i].hs_start, GC_heap_sects[i].hs_bytes,
                      TRUE);
+#    ifdef GC_COARSE_MPROTECT
+    GC_coarse_record_protection(GC_heap_sects[i].hs_start,
+                                GC_heap_sects[i].hs_bytes, FALSE);
+#    endif
   }
+#    ifdef GC_COARSE_MPROTECT
+  GC_coarse_free_protected = FALSE;
+#    endif
 }
 #  endif
 
@@ -4148,6 +4827,9 @@ GC_handle_protected_regions_limit(void)
 #    ifdef DARWIN
     GC_task_self = 0;
 #    endif
+    /* Protection may be disabled during a partial mark.  Revisit marked
+       objects and roots when writes can no longer be tracked. */
+    GC_invalidate_mark_state();
     GC_incremental = FALSE;
     WARN("GC incremental mode is turned off"
          " to prevent hitting VM maps limit\n",
@@ -5190,7 +5872,8 @@ GC_dirty_deinit(void)
 
 #if defined(MPROTECT_VDB) || defined(UFFDWP_VDB)
 STATIC void
-GC_protect_heap(void)
+GC_visit_protection_ranges_from_headers(void (*visit)(ptr_t, size_t),
+                                         GC_bool include_manual)
 {
   size_t i;
 
@@ -5201,6 +5884,10 @@ GC_protect_heap(void)
     struct hblk *current;
     struct hblk *current_start; /*< start of block to be protected */
     ptr_t limit;
+#  ifdef HASH_TL
+    bottom_index *bi = NULL;
+    word bi_key = GC_WORD_MAX;
+#  endif
 
     GC_ASSERT((ADDR(start) & (GC_page_size - 1)) == 0);
     GC_ASSERT((len & (GC_page_size - 1)) == 0);
@@ -5210,7 +5897,7 @@ GC_protect_heap(void)
      * differs from `HBLKSIZE`.
      */
     if (GC_page_size != HBLKSIZE) {
-      PROTECT(start, len);
+      visit(start, len);
       continue;
     }
 #  endif
@@ -5224,7 +5911,18 @@ GC_protect_heap(void)
       if (ADDR_LT((ptr_t)current, limit)) {
         const hdr *hhdr;
 
+#  ifdef HASH_TL
+        /* Protection callbacks do not change this heap's header index.
+           Reuse one bottom table while walking its consecutive blocks. */
+        word key = ADDR(current) >> (LOG_BOTTOM_SZ + LOG_HBLKSIZE);
+        if (key != bi_key) {
+          GET_BI(current, bi);
+          bi_key = key;
+        }
+        hhdr = HDR_FROM_BI(bi, current);
+#  else
         GET_HDR(current, hhdr);
+#  endif
         if (IS_FORWARDING_ADDR_OR_NIL(hhdr)) {
           /*
            * This can happen only if we are at the beginning of a heap
@@ -5239,9 +5937,30 @@ GC_protect_heap(void)
         if (HBLK_IS_FREE(hhdr)) {
           GC_ASSERT(modHBLKSZ(hhdr->hb_sz) == 0);
           nblocks = divHBLKSZ(hhdr->hb_sz);
+#  ifdef GC_COARSE_MPROTECT
+          /* A mapped free gap can join adjacent protection runs.  It
+             contains no syscall buffers; allochblk removes protection
+             before initializing a new block, including pointer-free
+             allocations.  Never bridge a decommitted interval. */
+          if (GC_coarse_enabled && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()
+              && (hhdr->hb_flags & WAS_UNMAPPED) == 0) {
+            is_ptrfree = FALSE;
+            GC_coarse_free_protected = TRUE;
+          }
+#  endif
         } else {
           nblocks = OBJ_SZ_TO_BLOCKS(hhdr->hb_sz);
           is_ptrfree = IS_PTRFREE(hhdr);
+#  ifdef GC_COARSE_MPROTECT
+          if (!is_ptrfree && GC_kind_is_manual(hhdr->hb_obj_kind)) {
+            if (include_manual)
+              GC_coarse_note_manual((ptr_t)current, nblocks * HBLKSIZE, TRUE);
+            else
+              is_ptrfree = TRUE;
+          }
+#  else
+          UNUSED_ARG(include_manual);
+#  endif
         }
       }
       if (is_ptrfree) {
@@ -5254,9 +5973,9 @@ GC_protect_heap(void)
            * Adjacent free blocks might be protected too because
            * of the alignment by the page size.
            */
-          PROTECT(current_start, cur_aligned - (ptr_t)current_start);
+          visit((ptr_t)current_start, (size_t)(cur_aligned - (ptr_t)current_start));
 #  else
-          PROTECT(current_start, (ptr_t)current - (ptr_t)current_start);
+          visit((ptr_t)current_start, (size_t)((ptr_t)current - (ptr_t)current_start));
 #  endif
         }
         if (ADDR_GE((ptr_t)current, limit))
@@ -5268,6 +5987,291 @@ GC_protect_heap(void)
     }
   }
 }
+
+#  ifdef GC_COARSE_MPROTECT
+STATIC void
+GC_coarse_record_eligible_range(ptr_t start, size_t bytes)
+{
+  GC_coarse_note_eligibility(start, bytes, TRUE);
+}
+
+#    if defined(GC_ASSERTIONS) || !defined(NDEBUG)
+STATIC void
+GC_coarse_check_eligible_range(ptr_t start, size_t bytes)
+{
+  ptr_t end = start + bytes;
+  while (ADDR_LT(start, end)) {
+    GC_coarse_section *section = GC_coarse_find_section(start);
+    ptr_t stop;
+    size_t page, last;
+    if (section == NULL) {
+      GC_coarse_eligibility_matches = FALSE;
+      return;
+    }
+    stop = ADDR_LT(end, section->end) ? end : section->end;
+    page = (size_t)(start - section->start) / HBLKSIZE;
+    last = (size_t)(stop - section->start) / HBLKSIZE;
+    for (; page < last; ++page) {
+      if ((section->eligible_pages[divWORDSZ(page)]
+           & ((word)1 << modWORDSZ(page))) == 0)
+        GC_coarse_eligibility_matches = FALSE;
+      ++GC_coarse_expected_pages;
+    }
+    start = stop;
+  }
+}
+
+/* The header walk is the independent reference: every expected bit must
+   be present, and equal populations rule out any unexpected extra bit. */
+STATIC void
+GC_coarse_check_eligibility(void)
+{
+  word actual = 0;
+  size_t i;
+  GC_coarse_eligibility_matches = TRUE;
+  GC_coarse_expected_pages = 0;
+  GC_visit_protection_ranges_from_headers(GC_coarse_check_eligible_range, TRUE);
+  for (i = 0; i < GC_coarse_section_count; ++i) {
+    GC_coarse_section *section = &GC_coarse_sections[i];
+    size_t pages = (size_t)(section->end - section->start) / HBLKSIZE;
+    size_t index, words = divWORDSZ(pages + CPP_WORDSZ - 1);
+    for (index = 0; index < words; ++index) {
+      word bits = section->eligible_pages[index];
+      while (bits != 0) {
+        bits &= bits - 1;
+        ++actual;
+      }
+    }
+  }
+  if (!GC_coarse_eligibility_matches || actual != GC_coarse_expected_pages)
+    ABORT("Protection eligibility bitmap differs from block headers");
+}
+
+#    endif
+
+STATIC void
+GC_coarse_visit_eligible_ranges(void (*visit)(ptr_t, size_t))
+{
+  ptr_t run = NULL, end = NULL;
+  size_t i;
+  /* Bitmap runs include mapped free gaps.  Keep the allocation fallback
+     aware of possible free-page protection even if this cache is lost. */
+  GC_coarse_free_protected = TRUE;
+  for (i = 0; i < GC_coarse_section_count; ++i) {
+    GC_coarse_section *section = &GC_coarse_sections[i];
+    size_t pages = (size_t)(section->end - section->start) / HBLKSIZE;
+    size_t index, words = divWORDSZ(pages + CPP_WORDSZ - 1);
+    for (index = 0; index < words; ++index) {
+      word bits = section->eligible_pages[index]
+                  & ~section->manual_pages[index];
+      size_t offset = index * CPP_WORDSZ;
+      while (bits != 0) {
+        unsigned skip = GC_coarse_trailing_zeroes(bits), count;
+        ptr_t first, last;
+        offset += skip;
+        bits >>= skip;
+        count = bits == GC_WORD_MAX ? CPP_WORDSZ
+                                    : GC_coarse_trailing_zeroes(~bits);
+        first = section->start + offset * HBLKSIZE;
+        last = first + (size_t)count * HBLKSIZE;
+        if (run != NULL && end != first) {
+          visit(run, (size_t)(end - run));
+          run = NULL;
+        }
+        if (run == NULL)
+          run = first;
+        end = last;
+        offset += count;
+        bits = count == CPP_WORDSZ ? 0 : bits >> count;
+      }
+    }
+  }
+  if (run != NULL)
+    visit(run, (size_t)(end - run));
+}
+#  endif
+
+STATIC void
+GC_visit_protection_ranges(void (*visit)(ptr_t, size_t))
+{
+#  ifdef GC_COARSE_MPROTECT
+  if (GC_coarse_enabled && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()) {
+    size_t i;
+    GC_coarse_sync_sections();
+    if (GC_coarse_enabled) {
+      if (!GC_coarse_eligibility_ready) {
+        for (i = 0; i < GC_coarse_section_count; ++i) {
+          GC_coarse_section *section = &GC_coarse_sections[i];
+          size_t pages = (size_t)(section->end - section->start) / HBLKSIZE;
+          BZERO(section->eligible_pages,
+                divWORDSZ(pages + CPP_WORDSZ - 1) * sizeof(word));
+          BZERO(section->manual_pages,
+                divWORDSZ(pages + CPP_WORDSZ - 1) * sizeof(word));
+        }
+        GC_coarse_eligibility_ready = TRUE;
+        GC_visit_protection_ranges_from_headers(GC_coarse_record_eligible_range, TRUE);
+      }
+      if (GC_coarse_eligibility_ready) {
+#    if defined(GC_ASSERTIONS) || !defined(NDEBUG)
+        GC_coarse_check_eligibility();
+#    endif
+        GC_coarse_visit_eligible_ranges(visit);
+        return;
+      }
+    }
+  }
+#  endif
+  GC_visit_protection_ranges_from_headers(visit, FALSE);
+}
+
+STATIC void
+GC_protect_range_inner(ptr_t start, size_t len)
+{
+#  ifdef GC_COARSE_MPROTECT
+  GC_coarse_heap_writable = FALSE;
+  if (GC_coarse_enabled && GC_coarse_exact_protection
+      && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()) {
+    if (GC_isolate_vdb_has_foreign_writes()) {
+      GC_coarse_exact_protection = FALSE;
+    } else if (!GC_coarse_has_permission(start, len, FALSE)) {
+      if (!GC_isolate_vdb_has_foreign_writes())
+        return;
+      GC_coarse_exact_protection = FALSE;
+    }
+  }
+#  endif
+  PROTECT(start, len);
+#  ifdef GC_COARSE_MPROTECT
+  ++GC_minor_grace_stats[7];
+  GC_minor_grace_stats[8] += len / GC_page_size;
+  if (GC_coarse_enabled && !IS_NON_MPROTECT_VDB())
+    GC_coarse_record_protection(start, len, TRUE);
+#  endif
+}
+
+#  ifdef GC_COARSE_MPROTECT
+/* Publish a union of deferred-page bits with the same concurrency rules
+   as single-page updates.  Other writers may add bits to this word. */
+STATIC void
+GC_coarse_publish_dirty_mask(size_t index, word mask)
+{
+#    if defined(THREADS) && defined(HAVE_LOCKFREE_AO_OR)
+  AO_or((volatile AO_t *)&GC_dirty_pages[index], (AO_t)mask);
+#    else
+#      if defined(THREADS) && defined(NEED_FAULT_HANDLER_LOCK)
+  GC_acquire_dirty_lock();
+#      endif
+  GC_dirty_pages[index] = GC_dirty_pages[index] | mask;
+#      if defined(THREADS) && defined(NEED_FAULT_HANDLER_LOCK)
+  GC_release_dirty_lock();
+#      endif
+#    endif
+}
+#  endif
+
+STATIC void
+GC_protect_range(ptr_t start, size_t len)
+{
+#  ifdef GC_COARSE_MPROTECT
+  if (GC_coarse_enabled && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()) {
+    ptr_t cursor = start, run = start, end = start + len;
+    size_t dirty_word = 0;
+    word dirty_mask = 0;
+    word gc_no = GC_gc_no;
+    GC_coarse_advance_age(gc_no);
+    while (ADDR_LT(cursor, end)) {
+      GC_coarse_section *section = GC_coarse_find_section(cursor);
+      ptr_t stop;
+      size_t first, last;
+      if (section == NULL) {
+        cursor += GC_page_size;
+        continue; /* Unknown pages use the normal protection path. */
+      }
+      stop = ADDR_LT(end, section->end) ? end : section->end;
+      first = (size_t)(cursor - section->start) / GC_page_size;
+      last = (size_t)(stop - section->start) / GC_page_size;
+      while (first < last) {
+        size_t index = divWORDSZ(first);
+        size_t count = CPP_WORDSZ - modWORDSZ(first);
+        word pending;
+        if (count > last - first)
+          count = last - first;
+        /* Protected pages have no outstanding grace.  Iterate only
+           writable bits, leaving cold protected history untouched. */
+        pending = ~section->protected_pages[index]
+                  & GC_coarse_page_mask(first, count);
+        while (pending != 0) {
+          size_t page = index * CPP_WORDSZ
+                        + GC_coarse_trailing_zeroes(pending);
+          ptr_t address = section->start + page * GC_page_size;
+          pending &= pending - 1;
+          GC_coarse_age_page(section, page, gc_no);
+          if (section->history[page].delay == 0)
+            continue;
+          ++GC_minor_grace_stats[4];
+          if (ADDR_LT(run, address))
+            GC_protect_range_inner(run, (size_t)(address - run));
+          /* Writable grace pages remain dirty after every snapshot,
+             including rescue passes. */
+          {
+            size_t hash = PHT_HASH((struct hblk *)address);
+            size_t next_word = divWORDSZ(hash);
+            if (dirty_mask != 0 && next_word != dirty_word) {
+              GC_coarse_publish_dirty_mask(dirty_word, dirty_mask);
+              dirty_mask = 0;
+            }
+            dirty_word = next_word;
+            dirty_mask |= (word)1 << modWORDSZ(hash);
+          }
+
+          run = address + GC_page_size;
+        }
+        first += count;
+      }
+      cursor = stop;
+    }
+    if (dirty_mask != 0)
+      GC_coarse_publish_dirty_mask(dirty_word, dirty_mask);
+    if (ADDR_LT(run, end))
+      GC_protect_range_inner(run, (size_t)(end - run));
+    return;
+  }
+#  endif
+  GC_protect_range_inner(start, len);
+}
+
+STATIC void
+GC_protect_heap(void)
+{
+#  ifdef GC_COARSE_MPROTECT
+  if (!GC_manual_vdb && !IS_NON_MPROTECT_VDB()) {
+    GC_coarse_advance_age(GC_gc_no);
+    GC_coarse_sync_sections();
+  }
+#  endif
+  if (GC_admission_skip_protect) {
+#  if defined(GC_COARSE_MPROTECT) && !defined(PREFER_MMAP_PROT_NONE) \
+      && !defined(FORCE_MPROTECT_BEFORE_MADVISE)
+    /* Linux madvise decommit retains mappings and permissions.  Making
+       heap sections writable neither touches their payload nor changes
+       their logical unmap state.  Other decommit modes keep the fallback. */
+    /* Wait for persistent failed probes.  Brief admission closures often
+       recover in productive workloads and do not amortize this transition. */
+    if (GC_young_full_rw_park && GC_admission_failed_probes >= 3
+        && !GC_coarse_heap_writable) {
+      GC_unprotect_all_heap();
+      GC_coarse_heap_writable = TRUE;
+      ++GC_admission_full_rw_epochs;
+    }
+#  endif
+    return;
+  }
+#  ifdef GC_COARSE_MPROTECT
+  GC_coarse_heap_writable = FALSE;
+#  endif
+  GC_visit_protection_ranges(GC_protect_range);
+}
+
 #endif
 
 #ifndef NO_MANUAL_VDB
@@ -5304,6 +6308,38 @@ GC_isolate_dirty_page(const void *p)
 #endif
 
 #ifndef GC_DISABLE_INCREMENTAL
+/* Freeze sweep candidates after finalization, before free-list filtering
+   can itself dirty cold pages. Tracing has finished using this bitmap.
+   Grace pages are already republished dirty by the mprotect path. */
+STATIC MAY_THREAD_LOCAL page_hash_table GC_young_remembered_pages;
+
+GC_INNER void
+GC_reset_young_remembered(GC_bool keep_current_dirty)
+{
+  size_t i;
+  for (i = 0; i < PHT_SIZE; ++i)
+    GC_young_remembered_pages[i] = keep_current_dirty ? GC_dirty_pages[i] : 0;
+}
+
+GC_INNER GC_bool
+GC_prepare_young_reclaim(void)
+{
+#  if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+  size_t i;
+
+  if (GC_incremental && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()
+      && !GC_isolate_vdb_has_foreign_writes()) {
+    GC_isolate_vdb_drain_pending();
+    if (GC_isolate_vdb_has_foreign_writes())
+      return FALSE;
+    for (i = 0; i < PHT_SIZE; ++i)
+      GC_grungy_pages[i] |= GC_dirty_pages[i];
+    return TRUE;
+  }
+#  endif
+  return FALSE;
+}
+
 GC_INNER void
 GC_read_dirty(GC_bool output_unneeded)
 {
@@ -5319,9 +6355,20 @@ GC_read_dirty(GC_bool output_unneeded)
   )
 #  endif
   {
+#  ifdef GC_COARSE_MPROTECT
+    if (GC_coarse_enabled && !GC_manual_vdb && !IS_NON_MPROTECT_VDB())
+      GC_isolate_vdb_drain_pending();
+#  endif
     if (!output_unneeded)
       BCOPY(CAST_AWAY_VOLATILE_PVOID(GC_dirty_pages), GC_grungy_pages,
             sizeof(GC_dirty_pages));
+    if (!output_unneeded && GC_generational && GC_young_retrace) {
+      size_t i;
+      for (i = 0; i < PHT_SIZE; ++i) {
+        GC_young_remembered_pages[i] |= GC_grungy_pages[i];
+        GC_grungy_pages[i] |= GC_young_remembered_pages[i];
+      }
+    }
     BZERO(CAST_AWAY_VOLATILE_PVOID(GC_dirty_pages), sizeof(GC_dirty_pages));
 #  if defined(MPROTECT_VDB) || defined(UFFDWP_VDB)
     if (!GC_manual_vdb) {
@@ -5344,6 +6391,100 @@ GC_read_dirty(GC_bool output_unneeded)
   GC_protect_heap();
 #  endif
 }
+
+#  ifdef GC_COARSE_MPROTECT
+/* Intersect exact pointer-bearing page eligibility with the dirty snapshot
+   a word at a time.  Resolve headers only for candidate pages.  A dirty page
+   inside a large allocation selects its starting block, so custom and typed
+   descriptors still receive the entire allocation through the usual marker.
+   No object pointers are added to the root set and no allocation is needed. */
+STATIC word
+GC_pending_dirty_word(size_t index)
+{
+  word dirty = GC_dirty_pages[index];
+  if (GC_young_retrace)
+    dirty |= GC_young_remembered_pages[index];
+  return dirty;
+}
+
+STATIC GC_bool
+GC_next_candidate(struct hblk *start, struct hblk **result, GC_bool pending)
+{
+  size_t section_index;
+  ptr_t cursor = (ptr_t)start;
+
+  GC_ASSERT(I_HOLD_LOCK());
+  if (!GC_generational || !GC_coarse_enabled || !GC_coarse_eligibility_ready
+      || GC_coarse_section_count != GC_n_heap_sects
+      || GC_page_size != HBLKSIZE || GC_manual_vdb || IS_NON_MPROTECT_VDB())
+    return FALSE;
+
+  for (section_index = GC_coarse_first_section(cursor);
+       section_index < GC_coarse_section_count; ++section_index) {
+    GC_coarse_section *section = &GC_coarse_sections[section_index];
+    size_t pages = (size_t)(section->end - section->start) / HBLKSIZE;
+    size_t page = ADDR_LT(cursor, section->start)
+                      ? 0 : (size_t)(cursor - section->start) / HBLKSIZE;
+
+    while (page < pages) {
+      size_t base_page = page & ~(size_t)(CPP_WORDSZ - 1);
+      ptr_t base = section->start + base_page * HBLKSIZE;
+      size_t hash = PHT_HASH(base), shift = modWORDSZ(hash);
+      word dirty = (pending ? GC_pending_dirty_word(divWORDSZ(hash))
+                            : GC_grungy_pages[divWORDSZ(hash)]) >> shift;
+      word bits;
+
+      if (shift != 0)
+        dirty |= (pending
+                      ? GC_pending_dirty_word((divWORDSZ(hash) + 1) % PHT_SIZE)
+                      : GC_grungy_pages[(divWORDSZ(hash) + 1) % PHT_SIZE])
+                 << (CPP_WORDSZ - shift);
+      bits = section->eligible_pages[divWORDSZ(page)] & dirty
+             & (GC_WORD_MAX << modWORDSZ(page));
+      while (bits != 0) {
+        size_t offset = GC_coarse_trailing_zeroes(bits);
+        struct hblk *block = (struct hblk *)(base + offset * HBLKSIZE);
+        hdr *hhdr = HDR(block);
+
+        bits &= bits - 1;
+        if (hhdr == NULL)
+          continue;
+        if (IS_FORWARDING_ADDR_OR_NIL(hhdr))
+          block = GC_find_starting_hblk(block, &hhdr);
+        if (HBLK_IS_FREE(hhdr) || IS_PTRFREE(hhdr))
+          continue;
+        if (ADDR_LT((ptr_t)block, (ptr_t)start)) {
+          /* This allocation was already returned before the cursor. */
+          page = (size_t)((ptr_t)(block + OBJ_SZ_TO_BLOCKS(hhdr->hb_sz))
+                          - section->start) / HBLKSIZE;
+          goto next_word;
+        }
+        if (GC_kind_is_manual(hhdr->hb_obj_kind))
+          ++GC_manual_kind_stats[5];
+        *result = block;
+        return TRUE;
+      }
+      page = base_page + CPP_WORDSZ;
+    next_word:;
+    }
+    cursor = section->end;
+  }
+  *result = NULL;
+  return TRUE;
+}
+
+GC_INNER GC_bool
+GC_next_dirty_candidate(struct hblk *start, struct hblk **result)
+{
+  return GC_next_candidate(start, result, FALSE);
+}
+
+GC_INNER GC_bool
+GC_next_pending_candidate(struct hblk *start, struct hblk **result)
+{
+  return GC_next_candidate(start, result, TRUE);
+}
+#  endif
 
 #  if !defined(NO_VDB_FOR_STATIC_ROOTS) && !defined(PROC_VDB)
 GC_INNER GC_bool
@@ -5418,13 +6559,44 @@ GC_remove_protection(struct hblk *h, size_t nblocks, GC_bool is_ptrfree)
   GC_ASSERT(I_HOLD_LOCK());
 #  endif
 #  if defined(MPROTECT_VDB) || defined(UFFDWP_VDB)
+#    ifdef GC_COARSE_MPROTECT
+  /* No permission lookup is needed after a complete writable transition.
+     A tracked full and its callbacks still record every write hint. */
+  if (GC_young_full_rw_park && GC_coarse_heap_writable
+      && GC_admission_vdb_parked
+      && (GC_admission_skip_protect
+          || (!GC_is_full_gc && !GC_collection_in_progress()))) {
+    ++GC_admission_full_rw_hints;
+    return;
+  }
+#    endif
   /*
    * Note it is not allowed to call `GC_printf` (and the friends) in this
    * function on Windows, see relevant `GC_stop_world` for the details.
    */
 #    ifdef DONT_PROTECT_PTRFREE
-  if (is_ptrfree)
+  if (is_ptrfree) {
+#      ifdef GC_COARSE_MPROTECT
+    /* Coarse protection may cover free blocks.  Remove it before a
+       pointer-free block is initialized or used as a syscall buffer. */
+    /* Keep this obligation after cache allocation failure: an untouched
+       large atomic allocation must also be writable by native syscalls. */
+    if ((GC_coarse_enabled || GC_coarse_free_protected)
+        && GC_auto_incremental && !GC_manual_vdb
+        && !IS_NON_MPROTECT_VDB()) {
+      struct hblk *first = HBLK_PAGE_ALIGNED(h);
+      ptr_t end = PTR_ALIGN_UP((ptr_t)(h + nblocks), GC_page_size);
+      size_t bytes = (size_t)(end - (ptr_t)first);
+      if ((!GC_coarse_enabled
+           || GC_coarse_has_permission((ptr_t)first, bytes, TRUE))
+          && !GC_coarse_unprotect((ptr_t)first, bytes, FALSE)) {
+        UNPROTECT(first, bytes);
+        GC_coarse_note_rw_remap((ptr_t)first, bytes);
+      }
+    }
+#      endif
     return;
+  }
 #    endif
   if (!GC_auto_incremental)
     return;
@@ -5442,6 +6614,22 @@ GC_remove_protection(struct hblk *h, size_t nblocks, GC_bool is_ptrfree)
     /* Page boundary following the block end. */
     ptr_t h_end = PTR_ALIGN_UP((ptr_t)(h + nblocks), GC_page_size);
 
+#    ifdef GC_COARSE_MPROTECT
+    /* During an untracked gap no partial can consume dirty history.
+       Known writable pages need neither a permission change nor another
+       write hint.  A tracked or interrupted full still records writes,
+       including those from its completion and reclaim callbacks. */
+    if (GC_young_quiet_vdb_hints && GC_admission_vdb_parked
+        && (GC_admission_skip_protect
+            || (!GC_is_full_gc && !GC_collection_in_progress()))
+        && GC_coarse_enabled && !is_ptrfree
+        && !GC_coarse_has_permission((ptr_t)h_trunc,
+                                    (size_t)(h_end - (ptr_t)h_trunc), TRUE)) {
+      ++GC_admission_quiet_hints;
+      return;
+    }
+#    endif
+
     /*
      * Note that we cannot examine `GC_dirty_pages` to check whether the
      * page at `h_trunc` has already been marked dirty as there could be
@@ -5458,7 +6646,19 @@ GC_remove_protection(struct hblk *h, size_t nblocks, GC_bool is_ptrfree)
         async_set_pht_entry_from_index(GC_dirty_pages, index);
       }
     }
-    UNPROTECT(h_trunc, h_end - (ptr_t)h_trunc);
+#    ifdef GC_COARSE_MPROTECT
+    GC_coarse_note_activity((ptr_t)h_trunc,
+                            (size_t)(h_end - (ptr_t)h_trunc), FALSE, FALSE);
+    if (!GC_coarse_unprotect((ptr_t)h_trunc,
+                            (size_t)(h_end - (ptr_t)h_trunc), FALSE))
+#    endif
+    {
+      UNPROTECT(h_trunc, h_end - (ptr_t)h_trunc);
+#    ifdef GC_COARSE_MPROTECT
+      GC_coarse_note_rw_remap((ptr_t)h_trunc,
+                             (size_t)(h_end - (ptr_t)h_trunc));
+#    endif
+    }
   }
 #  else
   /* Ignore write hints.  They do not help us here. */
@@ -5669,6 +6869,10 @@ GC_INNER void
 GC_dirty_update_child(void)
 {
   GC_ASSERT(I_HOLD_LOCK());
+#  ifndef GC_DISABLE_INCREMENTAL
+  /* The child cannot inherit a deferred request after its VDB is torn down. */
+  GC_incremental_start_pending = FALSE;
+#  endif
   if (0 == GC_task_self) {
     /* The GC incremental mode is off. */
     return;
@@ -5676,7 +6880,8 @@ GC_dirty_update_child(void)
 
   GC_ASSERT(GC_mprotect_state == GC_MP_NORMAL);
   GC_task_self = mach_task_self(); /*< needed by `UNPROTECT()` */
-  GC_unprotect_all_heap();
+  if (GC_auto_incremental)
+    GC_unprotect_all_heap();
 
   /* Restore the old task exception ports. */
   /* TODO: Should we do it in `fork_prepare_proc`/`fork_parent_proc`? */
@@ -6700,3 +7905,70 @@ GC_print_address_map(void)
   GC_err_printf("---------- End address map ----------\n");
 }
 #endif /* LINUX && ELF */
+
+GC_INNER GC_bool
+GC_kind_is_manual(unsigned kind)
+{
+#if defined(GC_COARSE_MPROTECT)
+  return kind < MAXOBJKINDS && GC_page_size == HBLKSIZE
+         && !GC_manual_vdb && !IS_NON_MPROTECT_VDB()
+         && (GC_manual_kind_bits[divWORDSZ(kind)]
+             & ((word)1 << modWORDSZ(kind))) != 0;
+#else
+  UNUSED_ARG(kind);
+  return FALSE;
+#endif
+}
+
+GC_API int GC_CALL
+GC_register_manual_kind(unsigned kind)
+{
+#if defined(GC_COARSE_MPROTECT)
+  const char *setting = GETENV("GC_BENCH_MANUAL_CODEBLOCK");
+  if (setting == NULL || atoi(setting) == 0 || GC_page_size != HBLKSIZE
+      || GC_manual_vdb || IS_NON_MPROTECT_VDB()
+      || kind >= GC_n_kinds
+      || (GC_obj_kinds[kind].ok_descriptor == 0
+          && !GC_obj_kinds[kind].ok_relocate_descr))
+    return 0;
+  if (!GC_kind_is_manual(kind)) {
+    GC_manual_kind_bits[divWORDSZ(kind)] |= (word)1 << modWORDSZ(kind);
+    ++GC_manual_kind_stats[0];
+    GC_coarse_invalidate_eligibility();
+  }
+  return 1;
+#else
+  UNUSED_ARG(kind);
+  return 0;
+#endif
+}
+
+GC_API void GC_CALL
+GC_manual_kind_dirty(const void *slot)
+{
+#if defined(GC_COARSE_MPROTECT)
+  hdr *hhdr;
+  struct hblk *page, *end;
+  if (!GC_incremental || GC_manual_kind_stats[0] == 0)
+    return;
+  hhdr = GC_find_header(slot);
+  if (IS_FORWARDING_ADDR_OR_NIL(hhdr)) {
+    void *base = GC_base((void *)slot);
+    if (base == NULL)
+      return;
+    hhdr = GC_find_header(base);
+  }
+  if (hhdr == NULL || HBLK_IS_FREE(hhdr)
+      || !GC_kind_is_manual(hhdr->hb_obj_kind))
+    return;
+  ++GC_manual_kind_stats[1];
+  page = hhdr->hb_block;
+  end = page + OBJ_SZ_TO_BLOCKS(hhdr->hb_sz);
+  for (; page < end; ++page) {
+    async_set_pht_entry_from_index(GC_dirty_pages, PHT_HASH(page));
+    ++GC_manual_kind_stats[2];
+  }
+#else
+  UNUSED_ARG(slot);
+#endif
+}

@@ -364,6 +364,11 @@ GC_API GC_MAY_THREAD_LOCAL GC_ATTR_DEPRECATED int GC_use_entire_heap;
 GC_API GC_MAY_THREAD_LOCAL GC_ATTR_DEPRECATED int GC_full_freq;
 GC_API void GC_CALL GC_set_full_freq(int);
 GC_API int GC_CALL GC_get_full_freq(void);
+/**
+ * As GC_get_full_freq, including the supported GC_FULL_FREQUENCY
+ * environment override if initialization has not started.  Unsynchronized.
+ */
+GC_API int GC_CALL GC_get_full_freq_for_init(void);
 
 /**
  * Bytes not considered candidates for collection.  Used only to control
@@ -478,6 +483,12 @@ GC_API GC_MAY_THREAD_LOCAL GC_ATTR_DEPRECATED unsigned long GC_time_limit;
 #define GC_TIME_UNLIMITED 999999
 GC_API void GC_CALL GC_set_time_limit(unsigned long);
 GC_API unsigned long GC_CALL GC_get_time_limit(void);
+/**
+ * As GC_get_time_limit, including the supported GC_PAUSE_TIME_TARGET
+ * environment override if initialization has not started.  Unsynchronized.
+ * A build with NO_CLOCK or GC_DISABLE_INCREMENTAL ignores that override.
+ */
+GC_API unsigned long GC_CALL GC_get_time_limit_for_init(void);
 
 /** A portable type definition of time with a nanosecond precision. */
 struct GC_timeval_s {
@@ -1261,6 +1272,13 @@ GC_API void GC_CALL GC_enable(void);
 GC_API void GC_CALL GC_set_manual_vdb_allowed(int);
 GC_API int GC_CALL GC_get_manual_vdb_allowed(void);
 
+/* Hybrid VDB policy for internal, dedicated kinds. Register before allocating.
+   Other kinds retain the ordinary mprotect VDB. A non-null reference store
+   into this kind must be followed, without a GC opportunity, by dirty(). */
+GC_API int GC_CALL GC_register_manual_kind(unsigned kind);
+GC_API void GC_CALL GC_manual_kind_dirty(const void *slot);
+
+
 /**
  * Select whether to allow usage of the `mprotect`-based VDB (virtual dirty
  * bits) mode for the incremental collection.  The default value is on
@@ -1319,6 +1337,26 @@ GC_API unsigned GC_CALL GC_get_supported_vdbs(void);
  * latter if not done yet.
  */
 GC_API void GC_CALL GC_enable_incremental(void);
+
+/**
+ * Enable dirty-page tracking while retaining synchronous full collections.
+ * A nonzero threshold defers mprotect tracking until the occupied heap
+ * reaches that many bytes after a completed full mark.  Zero activates
+ * tracking immediately.  The threshold does not affect other VDBs.
+ * Like GC_enable_incremental, call before initialization for an isolated
+ * mprotect heap.  Sets full frequency to zero and the time limit to
+ * GC_TIME_UNLIMITED, overriding initialization environment settings.
+ * Unsynchronized; collection policy setters may subsequently change it.
+ */
+GC_API void GC_CALL GC_enable_dirty_tracking(size_t /* start_threshold */);
+
+/**
+ * Enable stop-the-world generational collections before GC initialization.
+ * Reuse the ordinary full-collection allocation budget and collect before
+ * heap expansion, while retaining marks between partial collections.  The
+ * mprotect start threshold has the same meaning as for dirty tracking.
+ */
+GC_API void GC_CALL GC_enable_generational(size_t /* start_threshold */);
 
 /**
  * Return 1 (true) if the incremental mode is on, 0 otherwise.
