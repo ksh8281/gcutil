@@ -357,6 +357,22 @@ GC_get_min_bytes_allocd(void)
  * Return the minimum number of bytes that must be allocated between
  * collections to amortize the cost of the latter.  Should be nonzero.
  */
+MAY_THREAD_LOCAL word GC_bench_anchor_caps;
+MAY_THREAD_LOCAL word GC_bench_anchor_removed;
+MAY_THREAD_LOCAL word GC_bench_anchor_max_removed;
+MAY_THREAD_LOCAL word GC_bench_anchor_full_updates;
+MAY_THREAD_LOCAL int GC_bench_anchor_mode = -1;
+static MAY_THREAD_LOCAL word GC_bench_anchor_full_live;
+static MAY_THREAD_LOCAL word GC_bench_anchor_gc_no;
+static GC_bool GC_bench_anchor_enabled(void)
+{
+  if (GC_bench_anchor_mode < 0) {
+    const char *setting = GETENV("GC_BENCH_FULL_LIVE_ANCHOR");
+    GC_bench_anchor_mode = setting != NULL && atoi(setting) != 0;
+  }
+  return GC_bench_anchor_mode != 0;
+}
+
 static word
 min_bytes_allocd(void)
 {
@@ -397,7 +413,65 @@ min_bytes_allocd(void)
   total_root_size = 2 * stack_size + GC_root_size;
   scan_size = 2 * GC_composite_in_use + GC_atomic_in_use / 4 + total_root_size;
   result = scan_size / GC_free_space_divisor;
-  if (GC_incremental) {
+  if (GC_incremental_collection && !GC_generational) {
+    result /= 2;
+  }
+  return result > min_bytes_allocd_minimum ? result : min_bytes_allocd_minimum;
+}
+
+static word
+min_bytes_allocd_for_allocation(void)
+{
+  word result;
+  word stack_size;
+  /*
+   * Total size of roots, it includes double stack size, since the stack
+   * is expensive to scan.
+   */
+  word total_root_size;
+  /* Estimate of memory to be scanned during normal collection. */
+  word scan_size;
+
+  GC_ASSERT(I_HOLD_LOCK());
+#ifdef THREADS
+  if (GC_has_running_threads()) {
+    /* We are multi-threaded... */
+    stack_size = GC_total_stacksize;
+    /*
+     * For now, we just use the value computed during the latest garbage
+     * collection.
+     */
+#  ifdef DEBUG_THREADS
+    GC_log_printf("Total stacks size: %lu\n", (unsigned long)stack_size);
+#  endif
+  } else
+#endif
+  /* else */ {
+#ifdef STACK_NOT_SCANNED
+    stack_size = 0;
+#elif defined(STACK_GROWS_UP)
+    stack_size = (word)(GC_approx_sp() - GC_stackbottom);
+#else
+    stack_size = (word)(GC_stackbottom - GC_approx_sp());
+#endif
+  }
+
+  total_root_size = 2 * stack_size + GC_root_size;
+  scan_size = 2 * GC_composite_in_use + GC_atomic_in_use / 4;
+  if (GC_generational && GC_bench_anchor_enabled()
+      && GC_bench_anchor_gc_no != 0 && GC_gc_no >= GC_bench_anchor_gc_no
+      && scan_size > GC_bench_anchor_full_live) {
+    word removed = (scan_size - GC_bench_anchor_full_live)
+                   / GC_free_space_divisor;
+    ++GC_bench_anchor_caps;
+    GC_bench_anchor_removed += removed;
+    if (removed > GC_bench_anchor_max_removed)
+      GC_bench_anchor_max_removed = removed;
+    scan_size = GC_bench_anchor_full_live;
+  }
+  scan_size += total_root_size;
+  result = scan_size / GC_free_space_divisor;
+  if (GC_incremental_collection && !GC_generational) {
     result /= 2;
   }
   return result > min_bytes_allocd_minimum ? result : min_bytes_allocd_minimum;
@@ -454,15 +528,17 @@ GC_adj_bytes_allocd(void)
  * This differs from the code in `misc.c` file, which actually tries
  * to keep the stack clear of long-lived, client-generated garbage.
  */
-STATIC void
+STATIC GC_ATTR_NOINLINE void
 GC_clear_a_few_frames(void)
 {
 #ifndef CLEAR_STACK_NPTRS
 #  define CLEAR_STACK_NPTRS 64 /*< pointers */
 #endif
   volatile ptr_t frames[CLEAR_STACK_NPTRS];
+  size_t i;
 
-  BZERO(CAST_AWAY_VOLATILE_PVOID(frames), sizeof(frames));
+  for (i = 0; i < CLEAR_STACK_NPTRS; ++i)
+    frames[i] = NULL;
 }
 
 GC_API void GC_CALL
@@ -480,24 +556,29 @@ GC_start_incremental_collection(void)
 #endif
 }
 
-GC_INNER GC_bool
-GC_should_collect(void)
+STATIC GC_bool
+GC_should_collect_inner(GC_bool consume_request)
 {
   static MAY_THREAD_LOCAL word last_min_bytes_allocd, last_gc_no;
 
   GC_ASSERT(I_HOLD_LOCK());
   if (last_gc_no != GC_gc_no) {
-    last_min_bytes_allocd = min_bytes_allocd();
+    last_min_bytes_allocd = min_bytes_allocd_for_allocation();
     last_gc_no = GC_gc_no;
   }
 #ifndef GC_DISABLE_INCREMENTAL
   if (GC_should_start_incremental_collection) {
-    GC_should_start_incremental_collection = FALSE;
+    if (consume_request)
+      GC_should_start_incremental_collection = FALSE;
     return TRUE;
   }
+#else
+  UNUSED_ARG(consume_request);
 #endif
   if (GC_disable_automatic_collection)
     return FALSE;
+  if (UNLIKELY(GC_young_mark_clear_invalidated))
+    return TRUE;
 
   if (GC_last_heap_growth_gc_no == GC_gc_no) {
     /* Avoid expanding past limits used by black-listing. */
@@ -505,6 +586,57 @@ GC_should_collect(void)
   }
 
   return GC_adj_bytes_allocd() >= last_min_bytes_allocd;
+}
+
+GC_INNER GC_bool
+GC_should_collect(void)
+{
+  return GC_should_collect_inner(TRUE);
+}
+
+/* A reserve-policy lookup must not consume an explicit collection request
+   before the allocator reaches the code which can start that collection. */
+GC_INNER GC_bool
+GC_should_collect_for_alloc(void)
+{
+  return GC_should_collect_inner(FALSE);
+}
+
+GC_INNER MAY_THREAD_LOCAL word GC_large_budget_samples;
+GC_INNER MAY_THREAD_LOCAL word GC_large_budget_limited;
+GC_INNER MAY_THREAD_LOCAL word GC_large_budget_cap_limited;
+GC_INNER MAY_THREAD_LOCAL word GC_large_budget_sum;
+GC_INNER MAY_THREAD_LOCAL word GC_large_budget_min;
+GC_INNER MAY_THREAD_LOCAL word GC_large_budget_max;
+
+GC_INNER word
+GC_large_defer_budget(void)
+{
+  const char *setting = GETENV("GC_GENERATIONAL_LARGE_DEFER_DIVISOR");
+  word divisor = setting != NULL && atoi(setting) == 4 ? 4 : 8;
+  word allowance = min_bytes_allocd_for_allocation() / divisor;
+  word cap = (word)1024 * 1024;
+  const char *cap_setting = GETENV("GC_GENERATIONAL_LARGE_DEFER_CAP_KIB");
+
+  if (cap_setting != NULL) {
+    int kib = atoi(cap_setting);
+    if (kib == 768 || kib == 896 || kib == 1024)
+      cap = (word)kib * 1024;
+  }
+
+  ++GC_large_budget_samples;
+  if (allowance < cap) {
+    ++GC_large_budget_limited;
+  } else {
+    ++GC_large_budget_cap_limited;
+    allowance = cap;
+  }
+  GC_large_budget_sum += allowance;
+  if (GC_large_budget_min == 0 || allowance < GC_large_budget_min)
+    GC_large_budget_min = allowance;
+  if (allowance > GC_large_budget_max)
+    GC_large_budget_max = allowance;
+  return allowance;
 }
 
 /*
@@ -557,8 +689,18 @@ GC_should_collect_before_hblk_alloc(void)
   word budget = MIN_BYTES_SINCE_GC_BEFORE_COLLECT;
 
   GC_ASSERT(I_HOLD_LOCK());
-  if (GC_dont_gc || GC_incremental || GC_disable_automatic_collection)
+  if (GC_dont_gc || (GC_incremental_collection && !GC_generational)
+      || GC_disable_automatic_collection)
     return FALSE;
+  if (UNLIKELY(GC_young_mark_clear_invalidated))
+    return TRUE;
+
+  /* A partial collection may retain dead old objects. If its reclaimed
+     blocks cannot satisfy this request, try a full mark before growing
+     the heap. The partial just reset the allocation counter, so the
+     ordinary amortization budget alone would incorrectly permit growth. */
+  if (GC_generational && GC_n_partial_gcs != 0)
+    return TRUE;
 
   if (GC_allochblk_collect_divisor != 0) {
     word scaled = GC_heapsize / GC_allochblk_collect_divisor;
@@ -611,8 +753,295 @@ GC_notify_full_gc(void)
   }
 }
 
-STATIC GC_bool GC_stopped_mark(GC_stop_func stop_func);
+STATIC GC_bool GC_stopped_mark(GC_stop_func stop_func, GC_bool automatic);
 STATIC void GC_finish_collection(void);
+
+/* Admission affects automatic collection choice only.  A high surviving
+   closure is unproductive only when a following full also arrives before
+   allocation has progressed.  Keep the full's live-size anchor fixed while
+   suspended so gradual workload changes can eventually rearm the policy. */
+STATIC MAY_THREAD_LOCAL GC_bool GC_admission_closed;
+STATIC MAY_THREAD_LOCAL GC_bool GC_admission_sample;
+STATIC MAY_THREAD_LOCAL GC_bool GC_admission_pending;
+STATIC MAY_THREAD_LOCAL GC_bool GC_admission_ignore_full;
+STATIC MAY_THREAD_LOCAL word GC_admission_input;
+STATIC MAY_THREAD_LOCAL word GC_admission_pending_input;
+STATIC MAY_THREAD_LOCAL word GC_admission_origin;
+STATIC MAY_THREAD_LOCAL word GC_admission_anchor;
+STATIC MAY_THREAD_LOCAL word GC_admission_mark_total;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_park_vdb;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_admission_backoff;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_quiet_vdb_hints;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_full_rw_park;
+GC_INNER MAY_THREAD_LOCAL unsigned GC_admission_failed_probes;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_admission_vdb_parked;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_admission_skip_protect;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_poor_samples;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_closings;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_rearms;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_suppressed;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_closed_fulls;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_parks;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_restore_fulls;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_untracked_fulls;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_backoff_max;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_backoff_resets;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_quiet_hints;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_full_rw_epochs;
+GC_INNER MAY_THREAD_LOCAL word GC_admission_full_rw_hints;
+
+/* Compare completed collector work on this heap, independent of CPU speed.
+   Two costly automatic minors request a full, then reuse the existing admission
+   parking/rearm path. The margin reserves room for mutator-side VDB costs. */
+STATIC MAY_THREAD_LOCAL GC_bool GC_admission_cost_pending;
+STATIC MAY_THREAD_LOCAL unsigned GC_admission_cost_poor_streak;
+#ifndef NO_CLOCK
+STATIC MAY_THREAD_LOCAL CLOCK_TYPE GC_admission_cost_start_time;
+STATIC MAY_THREAD_LOCAL GC_bool GC_admission_cost_running;
+STATIC MAY_THREAD_LOCAL double GC_admission_last_full_cost_ms;
+STATIC MAY_THREAD_LOCAL double GC_admission_bad_minor_cost_ms;
+#endif
+
+STATIC void
+GC_admission_reset_cost(void)
+{
+  GC_admission_cost_pending = FALSE;
+  GC_admission_cost_poor_streak = 0;
+#ifndef NO_CLOCK
+  GC_admission_cost_running = FALSE;
+  GC_admission_last_full_cost_ms = 0;
+  GC_admission_bad_minor_cost_ms = 0;
+#endif
+}
+
+STATIC void
+GC_admission_cost_start(void)
+{
+#ifndef NO_CLOCK
+  GC_admission_cost_running
+      = GC_generational && GC_young_admission
+        && GC_time_limit == GC_TIME_UNLIMITED
+        && !GC_find_leak_inner && !GC_is_enumerate_reachable_objects;
+  if (GC_admission_cost_running)
+    GET_TIME(GC_admission_cost_start_time);
+#endif
+}
+
+STATIC void
+GC_admission_cost_finish(GC_bool is_full)
+{
+#ifndef NO_CLOCK
+  CLOCK_TYPE now;
+  double cost_ms;
+
+  if (!GC_admission_cost_running)
+    return;
+  GC_admission_cost_running = FALSE;
+  GET_TIME(now);
+  cost_ms = (double)MS_TIME_DIFF(now, GC_admission_cost_start_time)
+            + (double)NS_FRAC_TIME_DIFF(now, GC_admission_cost_start_time)
+                / 1000000.0;
+  if (is_full) {
+    /* Recheck against this full as the live graph may have changed. */
+    if (GC_admission_cost_pending
+        && GC_admission_bad_minor_cost_ms * 3.0 < cost_ms) {
+      GC_admission_cost_pending = FALSE;
+      GC_admission_cost_poor_streak = 0;
+    }
+    GC_admission_last_full_cost_ms = cost_ms;
+  } else if (GC_admission_sample && GC_admission_last_full_cost_ms > 0) {
+    if (cost_ms * 3.0 >= GC_admission_last_full_cost_ms) {
+      GC_admission_bad_minor_cost_ms
+          = GC_admission_cost_poor_streak == 0
+                ? cost_ms : (GC_admission_bad_minor_cost_ms + cost_ms) / 2.0;
+      if (GC_admission_cost_poor_streak < 2)
+        ++GC_admission_cost_poor_streak;
+      if (GC_admission_cost_poor_streak >= 2)
+        GC_admission_cost_pending = TRUE;
+      ++GC_admission_poor_samples;
+    } else {
+      GC_admission_cost_poor_streak = 0;
+      GC_admission_cost_pending = FALSE;
+    }
+  }
+#else
+  UNUSED_ARG(is_full);
+#endif
+}
+
+/* Read-only TLS policy query: also called from the write-fault handler.
+   A full can still be the next collection; this means minor scheduling is
+   enabled for this interval rather than parked/rejected by admission. */
+GC_INNER GC_bool
+GC_minor_grace_is_applicable(void)
+{
+  return GC_generational && GC_incremental && GC_full_freq != 0
+         && GC_time_limit == GC_TIME_UNLIMITED
+         && !GC_admission_vdb_parked
+         && (!GC_young_admission || !GC_admission_closed)
+         && !GC_find_leak_inner && !GC_is_enumerate_reachable_objects;
+}
+
+GC_INNER void
+GC_admission_deinit(void)
+{
+  GC_admission_reset_cost();
+  GC_admission_closed = GC_admission_sample = GC_admission_pending = FALSE;
+  GC_admission_ignore_full = FALSE;
+  GC_admission_input = GC_admission_pending_input = 0;
+  GC_admission_origin = GC_admission_anchor = 0;
+  GC_admission_mark_total = 0;
+  GC_admission_vdb_parked = GC_admission_skip_protect = FALSE;
+  GC_admission_poor_samples = GC_admission_closings = 0;
+  GC_admission_rearms = GC_admission_suppressed = GC_admission_closed_fulls = 0;
+  GC_admission_parks = GC_admission_restore_fulls = 0;
+  GC_admission_untracked_fulls = 0;
+  GC_admission_failed_probes = 0;
+  GC_admission_backoff_max = GC_admission_backoff_resets = 0;
+  GC_admission_quiet_hints = 0;
+  GC_admission_full_rw_epochs = GC_admission_full_rw_hints = 0;
+}
+
+STATIC void
+GC_admission_productive_probe(void)
+{
+  if (GC_admission_failed_probes != 0) {
+    GC_admission_failed_probes = 0;
+    ++GC_admission_backoff_resets;
+  }
+}
+
+GC_INNER void
+GC_admission_forget_repair(void)
+{
+  GC_admission_reset_cost();
+  GC_admission_sample = GC_admission_pending = FALSE;
+  GC_admission_ignore_full = TRUE;
+}
+
+STATIC void
+GC_admission_finish(GC_bool is_full)
+{
+  word total = GC_bytes_allocd_before_gc + GC_bytes_allocd;
+
+  if (!GC_generational || !GC_young_admission)
+    return;
+  if (is_full && GC_admission_vdb_parked && !GC_admission_skip_protect) {
+    GC_admission_vdb_parked = FALSE;
+    ++GC_admission_restore_fulls;
+  }
+  if (is_full && GC_admission_ignore_full) {
+    GC_admission_ignore_full = FALSE;
+    GC_admission_sample = GC_admission_pending = FALSE;
+    return;
+  }
+  if (GC_young_mark_clear_invalidated || GC_find_leak_inner
+      || GC_is_enumerate_reachable_objects) {
+    GC_admission_sample = GC_admission_pending = FALSE;
+    return;
+  }
+  if (is_full) {
+    word live = GC_composite_in_use + GC_atomic_in_use;
+
+    if (GC_admission_closed) {
+      word delta = live > GC_admission_anchor
+                       ? live - GC_admission_anchor
+                       : GC_admission_anchor - live;
+      word divisor = GC_admission_failed_probes >= 3 ? 2
+                         : GC_admission_failed_probes == 2 ? 4 : 8;
+      word change = GC_admission_anchor / divisor
+                      + (GC_admission_anchor % divisor != 0);
+      ++GC_admission_closed_fulls;
+      if (delta >= (change != 0 ? change : 1)) {
+        GC_admission_closed = FALSE;
+        ++GC_admission_rearms;
+      }
+    }
+    /* A minor retaining at least ninety percent of its input must buy
+       another allocation window before the next full to justify the work.
+       Small progress alone does not show that a full was avoided. */
+    if (!GC_admission_closed
+        && (GC_admission_cost_pending
+            || (GC_admission_pending
+                && GC_admission_mark_total - GC_admission_origin
+                       <= GC_admission_pending_input))) {
+      GC_admission_closed = TRUE;
+      GC_admission_anchor = live;
+      ++GC_admission_closings;
+      if (GC_young_admission_backoff && GC_admission_failed_probes < 3) {
+        ++GC_admission_failed_probes;
+        if (GC_admission_backoff_max < GC_admission_failed_probes)
+          GC_admission_backoff_max = GC_admission_failed_probes;
+      }
+    } else if (GC_admission_pending) {
+      /* A high marked closure can still be useful when allocation makes
+         progress before the next full.  Do not compound that history. */
+      GC_admission_productive_probe();
+    }
+    GC_admission_pending = GC_admission_cost_pending = FALSE;
+    if (GC_admission_closed)
+      GC_admission_cost_poor_streak = 0;
+    if (GC_young_park_vdb && GC_admission_closed && GC_incremental
+        && GC_get_actual_vdb() == GC_VDB_MPROTECT) {
+      if (!GC_admission_vdb_parked)
+        ++GC_admission_parks;
+      GC_admission_vdb_parked = TRUE;
+    }
+  } else if (GC_admission_sample && GC_admission_input != 0
+             && GC_young_live_bytes
+                    >= GC_admission_input - GC_admission_input / 10) {
+    if (!GC_admission_pending) {
+      GC_admission_pending = TRUE;
+      GC_admission_pending_input = GC_admission_input;
+      GC_admission_origin = total;
+    }
+    ++GC_admission_poor_samples;
+  } else {
+    if (GC_admission_sample && GC_admission_input != 0
+        && GC_admission_cost_poor_streak == 0)
+      GC_admission_productive_probe();
+    GC_admission_pending = FALSE;
+  }
+  GC_admission_sample = FALSE;
+}
+
+/* Also used to restart an abandoned minor.  No part of that attempt is
+   finalized or swept; discard its pending work before clearing all marks. */
+STATIC GC_bool
+GC_prepare_automatic_full(GC_bool unconditional)
+{
+  GC_bool never_stops;
+  GC_bool invalid_marks;
+
+  GC_notify_full_gc();
+  invalid_marks = GC_young_mark_clear_invalidated;
+  never_stops = unconditional || invalid_marks
+                || (GC_generational && GC_time_limit == GC_TIME_UNLIMITED
+                    && GC_default_stop_func == GC_never_stop_func);
+  ENTER_GC();
+  GC_invalidate_mark_state();
+  GC_promote_black_lists();
+  /* Like an ordinary never-stop full, a guaranteed trace can replace
+     pending lists with its new marks without first sweeping the old ones.
+     An interruptible trace and leak reporting still need valid old marks. */
+  if (!invalid_marks && (!never_stops || GC_find_leak_inner))
+    (void)GC_reclaim_all((GC_stop_func)0, !GC_find_leak_inner);
+  if (GC_young_mark_clear_invalidated)
+    never_stops = TRUE;
+  GC_clear_marks();
+  EXIT_GC();
+  GC_n_partial_gcs = 0;
+  GC_is_full_gc = TRUE;
+  GC_mark_deficit = 0;
+  GC_n_attempts = 0;
+  return never_stops;
+}
+
+STATIC int GC_CALLBACK
+GC_young_mark_stop_func(void)
+{
+  return GC_young_mark_aborted;
+}
 
 /*
  * Initiate a garbage collection if appropriate.  Choose judiciously
@@ -621,35 +1050,94 @@ STATIC void GC_finish_collection(void);
 STATIC void
 GC_maybe_gc(void)
 {
+  GC_bool marked;
+  GC_bool reject_dirty = FALSE;
+  GC_bool full_never_stops = FALSE;
+  GC_bool reject_admission = FALSE;
+  GC_bool automatic = TRUE;
+
   GC_ASSERT(I_HOLD_LOCK());
   ASSERT_CANCEL_DISABLED();
+#ifndef GC_DISABLE_INCREMENTAL
+  automatic = !GC_should_start_incremental_collection;
+#endif
   if (!GC_should_collect())
     return;
 
-  if (!GC_incremental) {
+  if (!GC_incremental_collection) {
     GC_gcollect_inner();
     return;
   }
 
   GC_ASSERT(!GC_collection_in_progress());
+  GC_admission_sample = FALSE;
+  reject_admission = GC_generational && GC_young_admission
+                     && GC_time_limit == GC_TIME_UNLIMITED && automatic
+                     && (GC_admission_closed || GC_admission_cost_pending);
 #ifdef PARALLEL_MARK
   if (GC_parallel)
     GC_wait_for_reclaim();
 #endif
-  if (GC_need_full_gc || GC_n_partial_gcs >= GC_full_freq) {
+  if (GC_generational && GC_young_retrace && !GC_need_full_gc
+      && !reject_admission && !GC_admission_vdb_parked
+      && GC_n_partial_gcs < GC_full_freq)
+    reject_dirty = GC_young_pending_cost_exceeds_live();
+  if (reject_dirty) {
+    ++GC_young_dirty_rejections;
+    ++GC_young_preflight_rejections;
+  }
+  if (reject_admission && !GC_need_full_gc
+      && GC_n_partial_gcs < GC_full_freq && !reject_dirty)
+    ++GC_admission_suppressed;
+  if (GC_need_full_gc || GC_n_partial_gcs >= GC_full_freq || reject_dirty
+      || reject_admission || GC_admission_vdb_parked) {
     GC_COND_LOG_PRINTF(
         "***>Full mark for collection #%lu after %lu bytes allocated\n",
         (unsigned long)GC_gc_no + 1, (unsigned long)GC_bytes_allocd);
-    GC_notify_full_gc();
-    ENTER_GC();
-    GC_promote_black_lists();
-    (void)GC_reclaim_all((GC_stop_func)0, TRUE);
-    GC_clear_marks();
-    EXIT_GC();
-    GC_n_partial_gcs = 0;
-    GC_is_full_gc = TRUE;
+    full_never_stops = GC_prepare_automatic_full(FALSE);
   } else {
     GC_n_partial_gcs++;
+  }
+
+  if (GC_generational && !GC_is_full_gc && GC_young_retrace) {
+    if (!GC_prepare_young_retrace()) {
+      full_never_stops = GC_prepare_automatic_full(FALSE);
+    } else {
+      /* Log replay leaves decoded addresses in dead preparation frames.
+         Clear them before the stopped-mark frame can overlap those slots. */
+      GC_clear_a_few_frames();
+      GC_noop6(0, 0, 0, 0, 0, 0);
+    }
+  }
+
+  if (GC_generational && !GC_is_full_gc) {
+    if (GC_young_log_retrace)
+      GC_begin_young_log(GC_n_partial_gcs < GC_full_freq);
+    GC_young_mark_active = TRUE;
+    GC_young_mark_aborted = FALSE;
+    GC_young_live_bytes = 0;
+    word young_input = GC_bytes_allocd;
+    if (GC_young_retrace)
+      young_input = young_input > GC_WORD_MAX - GC_young_retained_bytes
+                        ? GC_WORD_MAX : young_input + GC_young_retained_bytes;
+    GC_admission_sample = GC_young_admission && automatic
+                          && GC_time_limit == GC_TIME_UNLIMITED;
+    GC_admission_input = young_input;
+    GC_young_live_limit = young_input / 5;
+    /* Local experiments may measure the complete young closure rather
+       than truncating every survival observation at twenty percent. */
+    {
+      const char *setting = GETENV("GC_GENERATIONAL_SURVIVAL_PERCENT");
+      if (setting != NULL) {
+        int percent = atoi(setting);
+        if (percent == 0)
+          GC_young_live_limit = GC_WORD_MAX;
+        else if (percent > 0 && percent <= 100)
+          GC_young_live_limit = young_input / 100 * (word)percent
+                                + young_input % 100 * (word)percent / 100;
+      }
+    }
+    ++GC_young_mark_attempts;
   }
 
   /*
@@ -660,7 +1148,24 @@ GC_maybe_gc(void)
   if (GC_time_limit != GC_TIME_UNLIMITED)
     GET_TIME(GC_start_time);
 #endif
-  if (GC_stopped_mark(GC_timeout_stop_func)) {
+  marked = GC_stopped_mark(GC_young_mark_active ? GC_young_mark_stop_func
+                          : full_never_stops ? GC_never_stop_func
+                                             : GC_timeout_stop_func,
+                          automatic);
+  GC_young_mark_active = FALSE;
+  if (GC_young_mark_aborted) {
+    ++GC_young_mark_aborts;
+    GC_admission_sample = GC_admission_pending = FALSE;
+    /* An abandoned partial queue says nothing about the capacity needed
+       by a fresh full trace.  Full overflow can request growth again. */
+    GC_mark_stack_too_small = FALSE;
+    GC_young_mark_aborted = FALSE;
+    (void)GC_prepare_automatic_full(TRUE);
+    /* Never resume the failed minor or charge its marks to the full. */
+    marked = GC_stopped_mark(GC_never_stop_func, FALSE);
+    GC_ASSERT(marked);
+  }
+  if (marked) {
     SAVE_CALLERS_TO_LAST_STACK();
     GC_finish_collection();
   } else if (!GC_is_full_gc) {
@@ -704,6 +1209,10 @@ GC_try_to_collect_inner(GC_stop_func stop_func)
   GC_ASSERT(GC_is_initialized);
   if (GC_dont_gc || (*stop_func)())
     return FALSE;
+  /* An explicit old mark clear made the previous lazy-sweep marks unsafe.
+     Once collection is accepted, repair them with a completed full trace. */
+  if (GC_young_mark_clear_invalidated)
+    stop_func = GC_never_stop_func;
   if (GC_on_collection_event)
     GC_on_collection_event(GC_EVENT_START);
   if (GC_incremental && GC_collection_in_progress()) {
@@ -719,6 +1228,8 @@ GC_try_to_collect_inner(GC_stop_func stop_func)
     } while (GC_collection_in_progress());
   }
   GC_notify_full_gc();
+  if (GC_young_mark_clear_invalidated)
+    stop_func = GC_never_stop_func;
 #ifndef NO_CLOCK
   start_time_valid = FALSE;
   if ((GC_print_stats | (int)GC_measure_performance) != 0) {
@@ -740,19 +1251,24 @@ GC_try_to_collect_inner(GC_stop_func stop_func)
     GC_wait_for_reclaim();
 #endif
   ENTER_GC();
-  if ((GC_find_leak_inner || stop_func != GC_never_stop_func)
+  if (!GC_young_mark_clear_invalidated
+      && (GC_find_leak_inner || stop_func != GC_never_stop_func)
       && !GC_reclaim_all(stop_func, FALSE)) {
-    /* Aborted.  So far everything is still consistent. */
-    EXIT_GC();
-    /* TODO: Notify `GC_EVENT_ABANDON`. */
-    return FALSE;
+    if (!GC_young_mark_clear_invalidated) {
+      /* Aborted.  So far everything is still consistent. */
+      EXIT_GC();
+      /* TODO: Notify `GC_EVENT_ABANDON`. */
+      return FALSE;
+    }
   }
+  if (GC_young_mark_clear_invalidated)
+    stop_func = GC_never_stop_func;
   GC_invalidate_mark_state(); /*< flush mark stack */
   GC_clear_marks();
   SAVE_CALLERS_TO_LAST_STACK();
   GC_is_full_gc = TRUE;
   EXIT_GC();
-  if (!GC_stopped_mark(stop_func)) {
+  if (!GC_stopped_mark(stop_func, FALSE)) {
     if (!GC_incremental) {
       /*
        * We are partially done and have no way to complete or use
@@ -891,7 +1407,7 @@ GC_collect_a_little_inner(size_t n_blocks)
 #endif
       if (GC_stopped_mark(GC_n_attempts < max_prior_attempts
                               ? GC_timeout_stop_func
-                              : GC_never_stop_func)) {
+                              : GC_never_stop_func, FALSE)) {
         GC_finish_collection();
       } else {
         GC_n_attempts++;
@@ -982,7 +1498,7 @@ GC_INNER MAY_THREAD_LOCAL unsigned GC_unmap_threshold = MUNMAP_THRESHOLD;
  * if we succeed.
  */
 STATIC GC_bool
-GC_stopped_mark(GC_stop_func stop_func)
+GC_stopped_mark(GC_stop_func stop_func, GC_bool automatic)
 {
   ptr_t cold_gc_frame = GC_approx_sp();
   unsigned abandoned_at;
@@ -993,6 +1509,19 @@ GC_stopped_mark(GC_stop_func stop_func)
 
   GC_ASSERT(I_HOLD_LOCK());
   GC_ASSERT(GC_is_initialized);
+  GC_admission_cost_start();
+  /* Keep dirty snapshots, permission caches and foreign-write recovery
+     alive.  Only a guaranteed automatic full may omit reprotection.
+     A parked epoch always requires a tracked full before any minor. */
+  GC_admission_skip_protect
+      = automatic && GC_young_park_vdb && GC_admission_vdb_parked
+        && GC_admission_closed && GC_is_full_gc
+        && stop_func == GC_never_stop_func && GC_incremental
+        && !GC_admission_ignore_full && !GC_find_leak_inner
+        && !GC_is_enumerate_reachable_objects
+        && GC_get_actual_vdb() == GC_VDB_MPROTECT;
+  if (GC_admission_skip_protect)
+    ++GC_admission_untracked_fulls;
   ENTER_GC();
 #if !defined(REDIRECT_MALLOC) && defined(USE_WINALLOC)
   GC_add_current_malloc_heap();
@@ -1037,10 +1566,26 @@ GC_stopped_mark(GC_stop_func stop_func)
   }
 #endif
 
+  if (GC_generational && GC_young_admission) {
+    GC_admission_mark_total = GC_bytes_allocd_before_gc + GC_bytes_allocd;
+    if (GC_admission_sample) {
+      GC_admission_input = GC_bytes_allocd;
+      if (GC_young_retrace) {
+        GC_admission_input
+            = GC_young_retained_bytes > GC_WORD_MAX - GC_admission_input
+                  ? GC_WORD_MAX
+                  : GC_admission_input + GC_young_retained_bytes;
+      }
+    }
+  }
+
   /* Notify about marking from all roots. */
   if (GC_on_collection_event)
     GC_on_collection_event(GC_EVENT_MARK_START);
 
+  /* Include setup in MARK timing, then scrub its metadata walk before
+     conservative root scanning. */
+  GC_target_mark_table_begin();
   /* Minimize junk left in my registers and on the stack. */
   GC_clear_a_few_frames();
   GC_noop6(0, 0, 0, 0, 0, 0);
@@ -1051,7 +1596,14 @@ GC_stopped_mark(GC_stop_func stop_func)
     GC_parallel_mark_disabled = TRUE;
 #endif
   for (abandoned_at = 1; !(*stop_func)(); abandoned_at++) {
-    if (GC_mark_some(cold_gc_frame)) {
+    GC_bool complete = GC_mark_some(cold_gc_frame);
+
+    /* A custom marker or the final empty-stack callback can cross the
+       survival limit and still return a completed mark in this call. */
+    if (GC_young_mark_aborted) {
+      break;
+    }
+    if (complete) {
 #ifdef PARALLEL_MARK
       if (GC_parallel && GC_parallel_mark_disabled) {
         GC_COND_LOG_PRINTF("Stopped marking done after %u iterations"
@@ -1066,6 +1618,11 @@ GC_stopped_mark(GC_stop_func stop_func)
 #ifdef PARALLEL_MARK
   GC_parallel_mark_disabled = FALSE;
 #endif
+  GC_target_mark_table_end();
+  /* Successful completion is final before MARK_END callbacks run.  A
+     listener may set marks, but must not turn this completed minor into
+     an abandoned attempt after its collection number has advanced. */
+  GC_young_mark_active = FALSE;
 
   if (abandoned_at > 0) {
     /* Give the mutator a chance. */
@@ -1265,6 +1822,8 @@ GC_clear_fl_marks(ptr_t q)
   const struct hblk *last_h = h;
   hdr *hhdr = HDR(h);
   size_t sz = hhdr->hb_sz; /*< normally set only once */
+  GC_bool account_free = !GC_young_reclaim_active
+                         || GC_is_young_reclaim_candidate(hhdr);
 
   for (;;) {
     size_t bit_no = MARK_BIT_NO((size_t)((ptr_t)q - (ptr_t)h), sz);
@@ -1289,7 +1848,8 @@ GC_clear_fl_marks(ptr_t q)
       hhdr->hb_n_marks = n_marks;
 #endif
     }
-    GC_bytes_found -= (GC_signed_word)sz;
+    if (account_free)
+      GC_bytes_found -= (GC_signed_word)sz;
 
     q = (ptr_t)obj_link(q);
     if (NULL == q)
@@ -1301,6 +1861,8 @@ GC_clear_fl_marks(ptr_t q)
       /* Update `hhdr` and `sz`. */
       hhdr = HDR(h);
       sz = hhdr->hb_sz;
+      account_free = !GC_young_reclaim_active
+                     || GC_is_young_reclaim_candidate(hhdr);
     }
   }
 }
@@ -1375,12 +1937,17 @@ GC_compute_heap_usage_percent(void)
 STATIC void
 GC_finish_collection(void)
 {
+  GC_bool defer_automatic = GC_generational;
 #ifndef NO_CLOCK
   CLOCK_TYPE start_time = CLOCK_TYPE_INITIALIZER;
   CLOCK_TYPE finalize_time = CLOCK_TYPE_INITIALIZER;
 #endif
 
   GC_ASSERT(I_HOLD_LOCK());
+  /* Reclaim callbacks may allocate. A minor's pending pressure fallback
+     must not start a nested full collection before this finish completes. */
+  if (defer_automatic)
+    ++GC_dont_gc;
 #if defined(GC_ASSERTIONS) && defined(THREAD_LOCAL_ALLOC) \
     && !defined(DBG_HDRS_ALL)
   /* Check that we marked some of our own data. */
@@ -1433,6 +2000,12 @@ GC_finish_collection(void)
    * on the list itself might be marked, and the given function call
    * fixes it.
    */
+  GC_young_reclaim_active = FALSE;
+#ifndef GC_DISABLE_INCREMENTAL
+  if (GC_generational && !GC_is_full_gc && !GC_find_leak_inner
+      && !GC_is_enumerate_reachable_objects)
+    GC_young_reclaim_active = GC_prepare_young_reclaim();
+#endif
   clear_all_fl_marks();
 
   GC_VERBOSE_LOG_PRINTF("Bytes recovered before sweep - f.l. count = %ld\n",
@@ -1440,6 +2013,21 @@ GC_finish_collection(void)
 
   /* Reconstruct free lists to contain everything not marked. */
   GC_start_reclaim(FALSE);
+  GC_young_reclaim_active = FALSE;
+  if (GC_generational && GC_young_retrace) {
+    if (GC_is_full_gc) {
+      GC_defer_young_baseline();
+#ifndef GC_DISABLE_INCREMENTAL
+      /* Preserve writes performed after the full trace by completion,
+         finalization and reclaim callbacks. */
+      GC_reset_young_remembered(TRUE);
+#endif
+    } else {
+      GC_finish_young_log();
+      GC_young_retained_bytes = GC_young_live_bytes;
+    }
+  }
+
 
 #ifdef USE_MUNMAP
   if (GC_unmap_threshold > 0    /*< memory unmapping enabled? */
@@ -1471,7 +2059,16 @@ GC_finish_collection(void)
       COMMA_IF_USE_MUNMAP(TO_KiB_UL(GC_unmapped_bytes)),
       TO_KiB_UL(GC_our_mem_bytes - GC_heapsize + sizeof(GC_arrays)));
   GC_DBGLOG_PRINT_HEAP_IN_USE();
+  GC_admission_cost_finish(GC_is_full_gc);
+  GC_admission_finish(GC_is_full_gc);
+  GC_admission_skip_protect = FALSE;
   if (GC_is_full_gc) {
+    GC_bench_anchor_full_live = 2 * GC_composite_in_use + GC_atomic_in_use / 4;
+    GC_bench_anchor_gc_no = GC_gc_no;
+    if (GC_generational && GC_bench_anchor_enabled())
+      ++GC_bench_anchor_full_updates;
+    if (GC_generational)
+      GC_n_partial_gcs = 0;
     GC_used_heap_size_after_full = GC_heapsize - GC_large_free_bytes;
     GC_need_full_gc = FALSE;
   } else {
@@ -1489,6 +2086,25 @@ GC_finish_collection(void)
   GC_bytes_freed = 0;
   GC_finalizer_bytes_freed = 0;
 
+#if !defined(GC_DISABLE_INCREMENTAL) && defined(MPROTECT_VDB)
+  if (GC_incremental_start_pending
+      && GC_used_heap_size_after_full >= GC_incremental_start_threshold) {
+    /* All reachable objects were traced by this ordinary full collection.
+       Start dirty tracking only after all live objects have been traced;
+       the first protection pass covers every pointer-bearing heap range. */
+    GC_incremental_start_pending = FALSE;
+    GC_incremental = TRUE;
+    GC_handle_protected_regions_limit();
+    if (GC_incremental) {
+      GC_read_dirty(TRUE);
+      if (GC_incremental)
+        GC_COND_LOG_PRINTF("Incremental mprotect activated after full collection #%lu: occupied heap %lu bytes, threshold %lu bytes\n",
+                           (unsigned long)GC_gc_no,
+                           (unsigned long)GC_used_heap_size_after_full,
+                           (unsigned long)GC_incremental_start_threshold);
+    }
+  }
+#endif
   if (GC_on_collection_event)
     GC_on_collection_event(GC_EVENT_RECLAIM_END);
 #ifndef NO_CLOCK
@@ -1511,6 +2127,8 @@ GC_finish_collection(void)
   if (GC_print_stats)
     GC_print_finalization_stats();
 #endif
+  if (defer_automatic)
+    --GC_dont_gc;
 }
 
 /* Note: if `stop_func` is 0, then `GC_default_stop_func` is used instead. */
@@ -1985,7 +2603,7 @@ GC_collect_or_expand(word needed_blocks, unsigned flags, GC_bool retry)
   GC_ASSERT(I_HOLD_LOCK());
   GC_ASSERT(GC_is_initialized);
   DISABLE_CANCEL(cancel_state);
-  if (!GC_incremental && !GC_dont_gc
+  if ((!GC_incremental_collection || GC_generational) && !GC_dont_gc
       && ((GC_dont_expand && GC_bytes_allocd > 0)
           || (GC_fo_entries > last_fo_entries
               && (last_bytes_finalized | GC_bytes_finalized) != 0
@@ -2154,7 +2772,7 @@ GC_allocobj(size_t lg, int kind)
       break;
 
 #ifndef GC_DISABLE_INCREMENTAL
-    if (GC_incremental && GC_time_limit == GC_TIME_UNLIMITED && !tried_minor
+    if (GC_incremental_collection && GC_time_limit == GC_TIME_UNLIMITED && !tried_minor
         && !GC_dont_gc) {
       GC_collect_a_little_inner(1);
       tried_minor = TRUE;

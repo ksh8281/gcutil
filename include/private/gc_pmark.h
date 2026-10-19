@@ -142,10 +142,65 @@ GC_ms_push_obj_hdr(ptr_t obj, const hdr *hhdr, mse *mark_stack_top,
  * Push the contents of `current` onto the mark stack if it is a valid
  * pointer to a currently unmarked object.  Mark it.
  */
+GC_INLINE
+#if defined(__GNUC__)
+__attribute__((__always_inline__))
+#endif
+ GC_bool
+GC_target_probe(ptr_t current, hdr **hhdrp)
+{
+  GC_TARGET_REUSE_COUNT(0);
+#ifdef GC_HAS_TARGET_MARK_TABLE
+  word offset, bit;
+  const word *marks;
+  if (GC_target_mark_table == NULL) {
+    GC_TARGET_REUSE_COUNT(1);
+    return FALSE;
+  }
+  offset = ADDR(current) - GC_cage_base;
+  if (offset >= ((word)1 << 32)
+      || (offset & (GC_GRANULE_BYTES - 1)) != 0) {
+    GC_TARGET_REUSE_COUNT(2);
+    return FALSE;
+  }
+  marks = GC_target_mark_table[offset >> LOG_HBLKSIZE];
+  if (marks == NULL) {
+    GC_TARGET_REUSE_COUNT(3);
+    return FALSE;
+  }
+  bit = BYTES_TO_GRANULES(offset & (HBLKSIZE - 1));
+  if ((marks[divWORDSZ(bit)] & ((word)1 << modWORDSZ(bit))) != 0) {
+    GC_TARGET_REUSE_COUNT(4);
+    return TRUE;
+  }
+  GC_TARGET_REUSE_COUNT(5);
+  if (GC_target_header_reuse) {
+    /* Registration admits only allocated small collectable blocks.
+       The live mark array is an embedded member of that same header;
+       retain the ordinary object-offset validation and marking below.
+       Every block mapping/free operation invalidates the entire table. */
+    *hhdrp = (hdr *)((word)marks - offsetof(hdr, hb_marks));
+    GC_ASSERT((*hhdrp)->hb_block == HBLKPTR(current));
+    GC_ASSERT(!HBLK_IS_FREE(*hhdrp));
+    GC_ASSERT((*hhdrp)->hb_sz <= MAXOBJBYTES);
+    GC_TARGET_REUSE_COUNT(6);
+  }
+  return FALSE;
+#else
+  UNUSED_ARG(current);
+  UNUSED_ARG(hhdrp);
+  return FALSE;
+#endif
+}
+
 #define PUSH_CONTENTS(current, mark_stack_top, mark_stack_limit, source)   \
   do {                                                                     \
-    hdr *my_hhdr;                                                          \
-    HC_GET_HDR(current, my_hhdr, source); /*< contains `break` */          \
+    hdr *my_hhdr = NULL;                                                   \
+    if (GC_target_probe(current, &my_hhdr))                                \
+      break;                                                              \
+    if (my_hhdr == NULL) {                                                 \
+      HC_GET_HDR(current, my_hhdr, source); /*< contains `break` */        \
+    }                                                                     \
     mark_stack_top = GC_ms_push_contents_hdr(                              \
         current, my_hhdr, mark_stack_top, mark_stack_limit, source, TRUE); \
   } while (0)
@@ -234,7 +289,11 @@ GC_ms_push_obj_hdr(ptr_t obj, const hdr *hhdr, mse *mark_stack_top,
  * first page of an object, only if it is in fact a valid pointer
  * to the object.  Thus we can omit the otherwise necessary tests here.
  */
-GC_INLINE mse *
+GC_INLINE
+#if defined(__GNUC__)
+__attribute__((__always_inline__))
+#endif
+ mse *
 GC_ms_push_contents_hdr(ptr_t current, hdr *hhdr, mse *mark_stack_top,
                         mse *mark_stack_limit, ptr_t source,
                         GC_bool do_offset_check)
@@ -336,6 +395,13 @@ GC_ms_push_contents_hdr(ptr_t current, hdr *hhdr, mse *mark_stack_top,
                                      (unsigned long)GC_gc_no, (void *)base,
                                      (void *)source));
     INCR_MARKS(hhdr);
+#ifdef GC_TEST_ZERO_SOURCE_MUTATION
+    if (GC_test_zero_hidden_child == ~ADDR(base)
+        && GC_test_zero_hidden_field == ~ADDR(source))
+      GC_test_zero_child_from_field = TRUE;
+#endif
+    if (UNLIKELY(GC_young_mark_active) && GC_charge_young_mark(hhdr, base))
+      break;
     GC_STORE_BACK_PTR(source, base);
     mark_stack_top
         = GC_ms_push_obj_hdr(base, hhdr, mark_stack_top, mark_stack_limit);
@@ -466,6 +532,11 @@ GC_INNER mse *GC_mark_from(mse *mark_stack_top, const mse *mark_stack,
 
 /* "I" may not hold. */
 #define MS_INVALID 5
+
+/* Generational-only root probe.  The weak-reference fixpoint is postponed
+   until dirty old sources have subsequently been traced as well. */
+#define MS_PUSH_ROOTS_FIRST 6
+#define MS_TRACE_ROOTS_FIRST 7
 
 EXTERN_C_END
 

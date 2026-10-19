@@ -824,7 +824,59 @@ GC_envfile_getenv(const char *name)
 GC_API int GC_CALL
 GC_is_init_called(void)
 {
+#if defined(ENABLE_TLS_ACCESS_BY_ADDRESS) \
+    || defined(ENABLE_TLS_ACCESS_BY_PTHREAD_KEY)
+  /* The optimized TLS slot/offset is established by GC_init itself. */
+  return (int)GC_arrays_instance._is_initialized;
+#else
   return (int)GC_is_initialized;
+#endif
+}
+
+STATIC unsigned long
+GC_time_limit_from_env(unsigned long value)
+{
+#if !defined(GC_DISABLE_INCREMENTAL) && !defined(NO_CLOCK)
+  const char *str = GETENV("GC_PAUSE_TIME_TARGET");
+
+  if (str != NULL) {
+    long time_limit = atol(str);
+
+    if (time_limit > 0)
+      value = (unsigned long)time_limit;
+  }
+#endif
+  return value;
+}
+
+STATIC int
+GC_full_freq_from_env(int value)
+{
+#ifndef SMALL_CONFIG
+  const char *str = GETENV("GC_FULL_FREQUENCY");
+
+  if (str != NULL) {
+    int full_freq = atoi(str);
+
+    if (full_freq > 0)
+      value = full_freq;
+  }
+#endif
+  return value;
+}
+
+GC_API unsigned long GC_CALL
+GC_get_time_limit_for_init(void)
+{
+  return GC_is_init_called() ? GC_time_limit
+                            : GC_time_limit_from_env(GC_time_limit);
+}
+
+GC_API int GC_CALL
+GC_get_full_freq_for_init(void)
+{
+  return GC_is_init_called() ? GC_full_freq
+                            : GC_full_freq_from_env(GC_full_freq);
 }
 
 #if defined(GC_WIN32_THREADS) \
@@ -1624,31 +1676,8 @@ GC_init(void)
     }
   }
 #endif
-#if !defined(GC_DISABLE_INCREMENTAL) && !defined(NO_CLOCK)
-  {
-    const char *str = GETENV("GC_PAUSE_TIME_TARGET");
-
-    if (str != NULL) {
-      long time_limit = atol(str);
-
-      if (time_limit > 0) {
-        GC_time_limit = (unsigned long)time_limit;
-      }
-    }
-  }
-#endif
-#ifndef SMALL_CONFIG
-  {
-    const char *str = GETENV("GC_FULL_FREQUENCY");
-
-    if (str != NULL) {
-      int full_freq = atoi(str);
-
-      if (full_freq > 0)
-        GC_full_freq = full_freq;
-    }
-  }
-#endif
+  GC_time_limit = GC_time_limit_from_env(GC_time_limit);
+  GC_full_freq = GC_full_freq_from_env(GC_full_freq);
 #ifndef NO_BLACK_LISTING
   {
     char const *str = GETENV("GC_LARGE_ALLOC_WARN_INTERVAL");
@@ -1808,6 +1837,14 @@ GC_init(void)
 #ifndef GC_DISABLE_INCREMENTAL
   if (GC_incremental || GETENV("GC_ENABLE_INCREMENTAL") != NULL) {
     set_incremental_mode_on();
+#  if defined(MPROTECT_VDB) && !defined(CHECK_SOFT_VDB)
+    if (GC_incremental && GC_get_actual_vdb() == GC_VDB_MPROTECT) {
+      if (GC_incremental_start_threshold != 0) {
+        GC_incremental_start_pending = TRUE;
+        GC_incremental = FALSE;
+      }
+    }
+#  endif
     GC_ASSERT(0 == GC_bytes_allocd);
   }
 #endif
@@ -1938,6 +1975,152 @@ GC_init(void)
 #endif
 }
 
+GC_INNER MAY_THREAD_LOCAL word GC_incremental_start_threshold = 0;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_generational = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_reclaim_active = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_rescuer_marking = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_root_marking = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_roots_first = TRUE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_retrace = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_log_retrace = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_block_retrace = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_dense_retrace = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_old_sources = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_marked_bits = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_large_defer = FALSE;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_admission = FALSE;
+GC_INNER MAY_THREAD_LOCAL unsigned GC_young_dirty_percent = 100;
+GC_INNER MAY_THREAD_LOCAL word GC_young_live_bytes = 0;
+GC_INNER MAY_THREAD_LOCAL word GC_young_live_limit = 0;
+GC_INNER MAY_THREAD_LOCAL word GC_young_mark_attempts = 0;
+GC_INNER MAY_THREAD_LOCAL word GC_young_mark_aborts = 0;
+GC_INNER MAY_THREAD_LOCAL word GC_young_abort_rescuers = 0;
+GC_INNER MAY_THREAD_LOCAL word GC_young_abort_roots = 0;
+GC_INNER MAY_THREAD_LOCAL word GC_young_dirty_rejections = 0;
+
+GC_API void GC_CALL
+GC_enable_dirty_tracking(size_t start_threshold)
+{
+  GC_bool restore_tracking = GC_admission_vdb_parked;
+
+  GC_admission_deinit();
+  GC_young_admission = FALSE;
+  GC_young_park_vdb = FALSE;
+  GC_young_admission_backoff = FALSE;
+  GC_young_quiet_vdb_hints = FALSE;
+  GC_young_full_rw_park = FALSE;
+  GC_large_defer_deinit();
+  GC_young_large_defer = FALSE;
+  GC_young_retrace_deinit();
+  GC_young_retrace = FALSE;
+  GC_young_block_retrace = FALSE;
+  GC_young_dense_retrace = FALSE;
+  GC_young_log_retrace = FALSE;
+  GC_young_old_sources = FALSE;
+  GC_marker_cold_arrays._young_sparse_sources = FALSE;
+  GC_young_marked_bits = FALSE;
+  GC_young_bit_source_blocks = 0;
+  GC_generational = FALSE;
+#ifndef GC_DISABLE_INCREMENTAL
+  GC_incremental_start_threshold = (word)start_threshold;
+  GC_set_full_freq(0);
+  GC_set_time_limit(GC_TIME_UNLIMITED);
+  GC_enable_incremental();
+  if (restore_tracking)
+    GC_need_full_gc = TRUE;
+  /* GC_init may read policy settings from the environment.  This mode
+     explicitly requests full collection regardless of those settings. */
+  GC_set_full_freq(0);
+  GC_set_time_limit(GC_TIME_UNLIMITED);
+#else
+  UNUSED_ARG(start_threshold);
+  UNUSED_ARG(restore_tracking);
+#endif
+}
+
+GC_API void GC_CALL
+GC_enable_generational(size_t start_threshold)
+{
+  int full_frequency = GC_get_full_freq_for_init();
+
+  GC_enable_dirty_tracking(start_threshold);
+#ifndef GC_DISABLE_INCREMENTAL
+  GC_set_full_freq(full_frequency);
+  GC_set_time_limit(GC_TIME_UNLIMITED);
+  GC_generational = TRUE;
+  {
+    const char *roots_first = GETENV("GC_GENERATIONAL_ROOTS_FIRST");
+    const char *dirty_percent = GETENV("GC_GENERATIONAL_DIRTY_PERCENT");
+
+    const char *retrace = GETENV("GC_GENERATIONAL_RETRACE_YOUNG");
+    const char *log_retrace = GETENV("GC_GENERATIONAL_RETRACE_LOG");
+    const char *log_cap = GETENV("GC_GENERATIONAL_LOG_CAP_KIB");
+    const char *block_retrace = GETENV("GC_GENERATIONAL_RETRACE_BLOCKS");
+    const char *dense_retrace = GETENV("GC_GENERATIONAL_RETRACE_DENSE");
+    const char *old_sources = GETENV("GC_GENERATIONAL_OLD_SOURCES");
+    const char *sparse_sources = GETENV("GC_GENERATIONAL_SPARSE_SOURCES");
+    const char *marked_bits = GETENV("GC_GENERATIONAL_MARKED_BITS");
+    const char *large_defer = GETENV("GC_GENERATIONAL_LARGE_DEFER");
+    const char *admission = GETENV("GC_GENERATIONAL_ADMISSION");
+    const char *park_vdb = GETENV("GC_GENERATIONAL_PARK_VDB");
+    const char *backoff = GETENV("GC_GENERATIONAL_ADMISSION_BACKOFF");
+    const char *quiet_hints = GETENV("GC_GENERATIONAL_QUIET_VDB_HINTS");
+    const char *full_rw = GETENV("GC_GENERATIONAL_FULL_RW_PARK");
+    GC_young_admission = admission != NULL && atoi(admission) != 0;
+    GC_young_park_vdb = GC_young_admission && park_vdb != NULL
+                        && atoi(park_vdb) != 0;
+    GC_young_admission_backoff = GC_young_admission && backoff != NULL
+                                && atoi(backoff) != 0;
+    GC_young_quiet_vdb_hints = GC_young_park_vdb && quiet_hints != NULL
+                              && atoi(quiet_hints) != 0;
+    GC_young_full_rw_park = GC_young_park_vdb
+                          && GC_young_admission_backoff && full_rw != NULL
+                          && atoi(full_rw) != 0;
+    GC_young_large_defer = large_defer != NULL && atoi(large_defer) != 0;
+#if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+    GC_young_dense_retrace = dense_retrace != NULL && atoi(dense_retrace) != 0;
+    GC_young_marked_bits = marked_bits != NULL && atoi(marked_bits) != 0;
+#else
+    UNUSED_ARG(dense_retrace);
+    UNUSED_ARG(marked_bits);
+#endif
+    GC_young_block_retrace = block_retrace != NULL && atoi(block_retrace) != 0;
+    if (GC_young_dense_retrace)
+      GC_young_block_retrace = FALSE;
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+    GC_young_log_retrace = log_retrace != NULL && atoi(log_retrace) != 0;
+    if (GC_young_log_retrace) {
+      int cap = log_cap != NULL ? atoi(log_cap) : 1024;
+      if (cap > 0 && cap <= 8192)
+        GC_young_log_limit = (word)cap * 1024;
+      GC_young_dense_retrace = GC_young_block_retrace = FALSE;
+    }
+#else
+    UNUSED_ARG(log_retrace);
+    UNUSED_ARG(log_cap);
+#endif
+    GC_young_old_sources = GC_young_dense_retrace && old_sources != NULL
+                           && atoi(old_sources) != 0;
+#if defined(LINUX) && !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+    GC_young_sparse_sources = !GC_young_old_sources && sparse_sources != NULL
+                               && atoi(sparse_sources) != 0;
+#else
+    UNUSED_ARG(sparse_sources);
+#endif
+    GC_young_retrace = GC_young_log_retrace || GC_young_block_retrace || GC_young_dense_retrace
+                       || (dense_retrace != NULL && atoi(dense_retrace) != 0)
+                       || (retrace != NULL && atoi(retrace) != 0);
+    GC_young_roots_first = roots_first == NULL || atoi(roots_first) != 0;
+    GC_young_dirty_percent = dirty_percent == NULL ? 100
+                                                   : (unsigned)atoi(dirty_percent);
+    if (GC_young_dirty_percent > 100)
+      GC_young_dirty_percent = 100;
+  }
+#else
+  UNUSED_ARG(full_frequency);
+#endif
+}
+
 GC_API void GC_CALL
 GC_enable_incremental(void)
 {
@@ -1948,6 +2131,16 @@ GC_enable_incremental(void)
    * pointless.
    */
   if (!GC_find_leak_inner && NULL == GETENV("GC_DISABLE_INCREMENTAL")) {
+#  if defined(ENABLE_TLS_ACCESS_BY_ADDRESS) \
+      || defined(ENABLE_TLS_ACCESS_BY_PTHREAD_KEY)
+    /* GC_arrays uses a TLS slot/offset established by GC_init().  Before
+       that, access the actual TLS instance, as GC_init() itself does. */
+    if (!GC_arrays_instance._is_initialized) {
+      GC_arrays_instance._incremental = TRUE;
+      GC_init();
+      return;
+    }
+#  endif
     LOCK();
     if (!GC_incremental) {
 #  if defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
@@ -2055,6 +2248,45 @@ GC_deinit(void)
    * thread create/destroy cycles.
    */
   GC_isolate_vdb_deinit();
+#ifndef GC_DISABLE_INCREMENTAL
+  GC_incremental_start_pending = FALSE;
+  GC_incremental_start_threshold = 0;
+#endif
+  GC_admission_deinit();
+  GC_young_admission = FALSE;
+  GC_young_park_vdb = FALSE;
+  GC_young_admission_backoff = FALSE;
+  GC_young_quiet_vdb_hints = FALSE;
+  GC_young_full_rw_park = FALSE;
+  GC_large_defer_deinit();
+  GC_young_large_defer = FALSE;
+  GC_young_retrace_deinit();
+  GC_young_retrace = FALSE;
+  GC_young_block_retrace = FALSE;
+  GC_young_dense_retrace = FALSE;
+  GC_young_log_retrace = FALSE;
+  GC_young_old_sources = FALSE;
+  GC_young_sparse_sources = FALSE;
+  GC_young_marked_bits = FALSE;
+  GC_young_bit_source_blocks = 0;
+  GC_generational = FALSE;
+  GC_young_reclaim_active = FALSE;
+  GC_young_mark_active = FALSE;
+  GC_young_mark_aborted = FALSE;
+  GC_young_rescuer_marking = FALSE;
+  GC_young_root_marking = FALSE;
+  GC_young_roots_first = TRUE;
+  GC_young_dirty_percent = 100;
+  GC_young_live_bytes = 0;
+  GC_young_live_limit = 0;
+  GC_young_mark_attempts = 0;
+  GC_young_mark_aborts = 0;
+  GC_young_abort_rescuers = 0;
+  GC_young_abort_roots = 0;
+  GC_young_dirty_rejections = 0;
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+  GC_coarse_protection_deinit();
+#endif
 
 #  if defined(ESCARGOT_USE_32BIT_IN_64BIT)
   GC_release_cage();

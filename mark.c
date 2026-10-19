@@ -16,6 +16,130 @@
 
 #include "private/gc_pmark.h"
 #include "private/vdb_isolate.h"
+#ifdef LINUX
+# include <errno.h>
+# include <sys/mman.h>
+# include <stdint.h>
+#endif
+
+/* candidates, inactive table, rejected address, unregistered block,
+   already marked, unmarked registered target, reused header, cache miss. */
+GC_INNER MAY_THREAD_LOCAL word GC_target_reuse_stats[16];
+/* epochs, registrations, invalidations, capped blocks, OOM, max committed
+   table bytes, virtual bytes, hugepage-advice failures. */
+GC_INNER MAY_THREAD_LOCAL word GC_target_table_stats[8];
+GC_INNER MAY_THREAD_LOCAL word GC_source_page_stats[20];
+STATIC MAY_THREAD_LOCAL GC_bool GC_source_page_slice;
+STATIC MAY_THREAD_LOCAL GC_bool GC_source_page_audit;
+STATIC MAY_THREAD_LOCAL unsigned GC_source_batch_mode;
+#ifdef GC_SOURCE_BATCH_AUDIT
+GC_INNER MAY_THREAD_LOCAL word GC_source_batch_stats[12];
+GC_INNER MAY_THREAD_LOCAL word GC_source_batch_kinds[192][3];
+#endif
+
+#ifdef GC_HAS_TARGET_MARK_TABLE
+STATIC MAY_THREAD_LOCAL const word **GC_target_table_storage;
+STATIC MAY_THREAD_LOCAL word GC_target_table_page_seen[2048 / CPP_WORDSZ];
+STATIC MAY_THREAD_LOCAL size_t GC_target_table_pages;
+# define GC_TARGET_TABLE_BYTES \
+    (((size_t)1 << 32) / HBLKSIZE * sizeof(word *))
+#endif
+
+GC_INNER void
+GC_target_mark_table_end(void)
+{
+  GC_marker_cold_arrays._target_mark_table = NULL;
+  GC_marker_cold_arrays._target_header_reuse = FALSE;
+#ifdef GC_HAS_TARGET_MARK_TABLE
+  if (GC_target_table_storage != NULL)
+    (void)munmap((void *)GC_target_table_storage, GC_TARGET_TABLE_BYTES);
+  GC_target_table_storage = NULL;
+#endif
+}
+
+#ifdef GC_HAS_TARGET_MARK_TABLE
+static void GC_CALLBACK
+GC_target_register_block(struct hblk *h, void *unused)
+{
+  hdr *hhdr = HDR(h);
+  word offset, slot, page, mask;
+  UNUSED_ARG(unused);
+  if (HBLK_IS_FREE(hhdr) || IS_UNCOLLECTABLE(hhdr->hb_obj_kind)
+      || hhdr->hb_sz > MAXOBJBYTES || hhdr->hb_block != h)
+    return;
+  offset = ADDR(h) - GC_cage_base;
+  if (offset >= ((word)1 << 32))
+    return;
+  slot = offset >> LOG_HBLKSIZE;
+  page = slot * sizeof(word *) / GC_page_size;
+  GC_ASSERT(page < 2048);
+  mask = (word)1 << modWORDSZ(page);
+  if ((GC_target_table_page_seen[divWORDSZ(page)] & mask) == 0) {
+    if (GC_target_table_pages >= (1024 * 1024) / GC_page_size) {
+      ++GC_target_table_stats[3];
+      return;
+    }
+    GC_target_table_page_seen[divWORDSZ(page)] |= mask;
+    ++GC_target_table_pages;
+  }
+  GC_target_table_storage[slot] = hhdr->hb_marks;
+  ++GC_target_table_stats[1];
+}
+#endif
+
+GC_ATTR_NOINLINE GC_INNER void
+GC_target_mark_table_begin(void)
+{
+  GC_target_mark_table_end();
+#ifdef GC_HAS_TARGET_MARK_TABLE
+  {
+    const char *setting = GETENV("GC_BENCH_TARGET_MARK_TABLE");
+    int mode = setting != NULL ? atoi(setting) : 0;
+    void *memory;
+    size_t bytes;
+    if (mode == 0 || (!GC_young_mark_active && mode < 3)
+        || GC_young_mark_aborted || GC_find_leak_inner
+        || GC_is_enumerate_reachable_objects || GC_page_size < 4096
+        || GC_page_size > 1024 * 1024
+        || (GC_cage_base & (HBLKSIZE - 1)) != 0)
+      return;
+    memory = mmap(NULL, GC_TARGET_TABLE_BYTES, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) {
+      ++GC_target_table_stats[4];
+      return;
+    }
+# ifdef MADV_NOHUGEPAGE
+    if (madvise(memory, GC_TARGET_TABLE_BYTES, MADV_NOHUGEPAGE) != 0) {
+      int advice_errno = errno;
+      ++GC_target_table_stats[7];
+      /* Linux rejects an unsupported advice even for an empty range.
+         Keep the table if THP advice itself is unavailable, while retaining
+         the fallback for errors on a kernel that supports the advice. */
+      if (advice_errno != EINVAL
+          || madvise(NULL, 0, MADV_NOHUGEPAGE) == 0 || errno != EINVAL) {
+        (void)munmap(memory, GC_TARGET_TABLE_BYTES);
+        return;
+      }
+    }
+# endif
+    GC_target_table_storage = (const word **)memory;
+    GC_target_table_pages = 0;
+    BZERO(GC_target_table_page_seen, sizeof(GC_target_table_page_seen));
+    GC_apply_to_all_blocks(GC_target_register_block, NULL);
+    bytes = GC_target_table_pages * GC_page_size;
+    if (bytes > GC_target_table_stats[5])
+      GC_target_table_stats[5] = (word)bytes;
+    GC_target_table_stats[6] = GC_TARGET_TABLE_BYTES;
+    ++GC_target_table_stats[0];
+    /* Publish only after registration. Invalidation disables it immediately,
+       while storage remains owned until the stopped mark returns. */
+    GC_target_header_reuse = mode >= 2;
+    GC_target_mark_table = GC_target_table_storage;
+  }
+#endif
+}
+
 
 /*
  * Make arguments appear live to compiler.  Put here to minimize the
@@ -288,6 +412,29 @@ clear_marks_for_block(struct hblk *h, void *dummy)
 #endif
 }
 
+STATIC MAY_THREAD_LOCAL GC_bool GC_young_baseline_pending;
+STATIC void GC_invalidate_young_baseline(void);
+STATIC GC_bool GC_young_clear_requires_full(const hdr *hhdr, size_t bit_no);
+GC_INNER MAY_THREAD_LOCAL word GC_young_old_source_blocks;
+GC_INNER MAY_THREAD_LOCAL word GC_young_bit_source_blocks;
+GC_INNER MAY_THREAD_LOCAL word GC_young_old_source_empty;
+GC_INNER MAY_THREAD_LOCAL word GC_young_old_source_recoveries;
+STATIC MAY_THREAD_LOCAL GC_bool GC_young_source_filter_disabled;
+STATIC MAY_THREAD_LOCAL GC_bool GC_sparse_sources_armed;
+
+/* Keep this armed after the map is released: a late callback can change a
+   source whose earlier scan was deliberately omitted. */
+GC_INNER void
+GC_note_sparse_source_mutation(void)
+{
+#ifdef GC_TEST_ZERO_SOURCE_MUTATION
+  if (GC_test_zero_suppress_mutation)
+    return;
+#endif
+  if (GC_young_mark_active && GC_sparse_sources_armed)
+    GC_young_source_recovery_pending = TRUE;
+}
+
 /* Slow but general routines for setting/clearing/getting mark bits. */
 
 GC_API void GC_CALL
@@ -297,14 +444,25 @@ GC_set_mark_bit(const void *p)
   hdr *hhdr = HDR(h);
   size_t bit_no = MARK_BIT_NO((size_t)((ptr_t)p - (ptr_t)h), hhdr->hb_sz);
 
+  if (GC_young_mark_active && !IS_PTRFREE(hhdr))
+    GC_note_sparse_source_mutation();
   if (!mark_bit_from_hdr(hhdr, bit_no)) {
     set_mark_bit_from_hdr(hhdr, bit_no);
     INCR_MARKS(hhdr);
+    if (UNLIKELY(GC_young_mark_active)) {
+      (void)GC_charge_young_mark(hhdr, p);
+      /* The public mark-bit API does not enqueue the object's fields.
+         A rescuer which omits young sources cannot rely on that bit alone.
+         Preserve even a callback's one-shot mark while revisiting sources
+         already passed by the cursor, just like mark-stack recovery. */
+      if (GC_young_old_sources && !IS_PTRFREE(hhdr))
+        GC_young_source_recovery_pending = TRUE;
+    }
   }
 }
 
-GC_API void GC_CALL
-GC_clear_mark_bit(const void *p)
+STATIC void
+GC_clear_mark_bit_inner(const void *p, GC_bool invalidate_young)
 {
   struct hblk *h = HBLKPTR(p);
   hdr *hhdr = HDR(h);
@@ -312,6 +470,17 @@ GC_clear_mark_bit(const void *p)
 
   if (mark_bit_from_hdr(hhdr, bit_no)) {
     size_t n_marks = hhdr->hb_n_marks;
+
+    /* A late census cannot reconstruct a live old object's removed bit.
+       Ordinary allocation/free do not use this explicit marking API. */
+    if (invalidate_young && GC_young_retrace
+        && GC_young_clear_requires_full(hhdr, bit_no)) {
+      GC_young_mark_clear_invalidated = TRUE;
+      GC_invalidate_young_baseline();
+      if ((GC_young_block_retrace || GC_young_dense_retrace || GC_young_log_retrace)
+          && GC_young_mark_active)
+        GC_young_mark_aborted = TRUE;
+    }
 
     GC_ASSERT(n_marks != 0);
     clear_mark_bit_from_hdr(hhdr, bit_no);
@@ -330,6 +499,20 @@ GC_clear_mark_bit(const void *p)
   }
 }
 
+GC_API void GC_CALL
+GC_clear_mark_bit(const void *p)
+{
+  GC_clear_mark_bit_inner(p, TRUE);
+}
+
+/* Only for a collector-owned entry already unlinked from its last owner.
+   Clearing that deliberately dead entry cannot remove a live old root. */
+GC_INNER void
+GC_clear_unlinked_mark_bit(const void *p)
+{
+  GC_clear_mark_bit_inner(p, FALSE);
+}
+
 GC_API int GC_CALL
 GC_is_marked(const void *p)
 {
@@ -346,10 +529,1022 @@ GC_clear_marks(void)
   /* The initialization is needed for `GC_push_roots()`. */
   GC_ASSERT(GC_is_initialized);
 
+  if (GC_young_retrace)
+    GC_invalidate_young_baseline();
+  if (GC_young_mark_clear_invalidated)
+    GC_admission_forget_repair();
+  GC_young_mark_clear_invalidated = FALSE;
   GC_apply_to_all_blocks(clear_marks_for_block, NULL);
   GC_objects_are_marked = FALSE;
   GC_mark_state = MS_INVALID;
   GC_scan_ptr = NULL;
+}
+
+/* Experimental old-generation census.  libc storage is outside the GC heap;
+   it records mark bits, not owning references to object payloads. */
+typedef struct {
+  struct hblk *block;
+  hdr *header;
+  size_t size;
+  word descriptor;
+  size_t n_marks;
+  unsigned char kind;
+  unsigned char flags;
+  unsigned char marks[sizeof(((hdr *)0)->hb_marks)];
+} GC_young_old_entry;
+
+STATIC MAY_THREAD_LOCAL GC_young_old_entry *GC_young_old_entries;
+STATIC MAY_THREAD_LOCAL size_t GC_young_old_count;
+STATIC MAY_THREAD_LOCAL size_t GC_young_old_capacity;
+STATIC MAY_THREAD_LOCAL GC_bool GC_young_old_valid;
+GC_INNER MAY_THREAD_LOCAL word GC_young_retained_bytes;
+GC_INNER MAY_THREAD_LOCAL word GC_young_snapshot_bytes;
+STATIC MAY_THREAD_LOCAL GC_bool GC_young_full_was_tracked;
+STATIC MAY_THREAD_LOCAL GC_bool GC_young_captured_since_full;
+STATIC MAY_THREAD_LOCAL GC_word GC_young_baseline_gc_no;
+GC_INNER MAY_THREAD_LOCAL word GC_young_baseline_captures;
+GC_INNER MAY_THREAD_LOCAL word GC_young_preflight_rejections;
+
+/* Bounded experimental young-survivor log.  Storage is outside the GC
+   heap and is released at every full.  Overflow completes this minor with
+   sticky marks and forces the next collection through full preparation. */
+#ifdef ESCARGOT_USE_32BIT_IN_64BIT
+typedef uint32_t GC_young_log_address;
+#else
+typedef word GC_young_log_address;
+#endif
+#define GC_YOUNG_LOG_BLOCK_BITS ((size_t)1 << 16)
+#define GC_YOUNG_LOG_BLOCK_WORDS (GC_YOUNG_LOG_BLOCK_BITS / CPP_WORDSZ)
+#define GC_YOUNG_LOG_HASH(block) (PHT_HASH(block) & (GC_YOUNG_LOG_BLOCK_BITS - 1))
+STATIC MAY_THREAD_LOCAL GC_young_log_address *GC_young_log_entries;
+STATIC MAY_THREAD_LOCAL size_t GC_young_log_count;
+STATIC MAY_THREAD_LOCAL size_t GC_young_log_mapped;
+STATIC MAY_THREAD_LOCAL word *GC_young_log_blocks;
+STATIC MAY_THREAD_LOCAL GC_bool GC_young_log_failed;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_young_log_recording;
+GC_INNER MAY_THREAD_LOCAL word GC_young_log_limit = 1024 * 1024;
+GC_INNER MAY_THREAD_LOCAL word GC_young_log_events;
+GC_INNER MAY_THREAD_LOCAL word GC_young_log_overflows;
+GC_INNER MAY_THREAD_LOCAL word GC_young_log_cleared;
+GC_INNER MAY_THREAD_LOCAL word GC_young_log_compacted;
+GC_INNER MAY_THREAD_LOCAL word GC_young_log_max_entries;
+GC_INNER MAY_THREAD_LOCAL word GC_young_log_max_bytes;
+
+STATIC void
+GC_release_young_log(void)
+{
+#ifdef LINUX
+  if (GC_young_log_entries != NULL)
+    (void)munmap(GC_young_log_entries, GC_young_log_mapped);
+#endif
+  GC_young_log_entries = NULL;
+  GC_young_log_count = GC_young_log_mapped = 0;
+  free(GC_young_log_blocks);
+  GC_young_log_blocks = NULL;
+  GC_young_log_failed = FALSE;
+  GC_young_log_recording = FALSE;
+}
+
+/* Once the last permitted minor starts, no later trace may whiten its
+   unlogged survivors.  Keep the mandatory full even if the API raises the
+   full frequency before the next request.  Earlier logs are already
+   consumed, so their mapping can be returned before this trace. */
+GC_INNER void
+GC_begin_young_log(GC_bool can_repeat)
+{
+  GC_young_log_recording = can_repeat;
+  if (!can_repeat) {
+    GC_release_young_log();
+    GC_young_snapshot_bytes = 0;
+    GC_young_log_failed = TRUE;
+  }
+}
+
+GC_INNER void
+GC_record_young_log_mark(const void *base)
+{
+#ifdef LINUX
+  word address = ADDR(base);
+
+  if (!GC_young_old_valid || GC_young_log_failed)
+    return;
+  if (GC_young_log_entries == NULL) {
+    void *memory = mmap(NULL, (size_t)GC_young_log_limit,
+                        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                        -1, 0);
+    if (memory == MAP_FAILED)
+      goto failed;
+    GC_young_log_entries = (GC_young_log_address *)memory;
+    GC_young_log_mapped = (size_t)GC_young_log_limit;
+    GC_young_snapshot_bytes = GC_young_log_mapped
+                             + GC_YOUNG_LOG_BLOCK_WORDS * sizeof(word);
+    if (GC_young_log_max_bytes < GC_young_snapshot_bytes)
+      GC_young_log_max_bytes = GC_young_snapshot_bytes;
+  }
+  if (GC_young_log_count
+      == GC_young_log_mapped / sizeof(*GC_young_log_entries))
+    goto failed;
+# ifdef ESCARGOT_USE_32BIT_IN_64BIT
+  if (GC_cage_base == 0 || address < GC_cage_base
+      || address - GC_cage_base > (word)UINT32_MAX)
+    goto failed;
+  address -= GC_cage_base;
+# endif
+  GC_young_log_entries[GC_young_log_count++] = (GC_young_log_address)address;
+  set_pht_entry_from_index(GC_young_log_blocks,
+                          GC_YOUNG_LOG_HASH(HBLKPTR(base)));
+  ++GC_young_log_events;
+  if (GC_young_log_max_entries < GC_young_log_count)
+    GC_young_log_max_entries = GC_young_log_count;
+  return;
+failed:
+  GC_young_log_failed = TRUE;
+  GC_young_log_recording = FALSE;
+  ++GC_young_log_overflows;
+#else
+  UNUSED_ARG(base);
+#endif
+}
+
+/* A false free-list root may have been cleared and its entire block freed
+   or reused after logging.  Never install or remove a bit using an old
+   layout.  A matching address reused between fulls remains young. */
+STATIC hdr *
+GC_current_young_log_mark(size_t index, ptr_t *base)
+{
+  word address = (word)GC_young_log_entries[index];
+  struct hblk *block;
+  hdr *hhdr;
+  size_t offset, size, bit;
+#ifdef ESCARGOT_USE_32BIT_IN_64BIT
+  address += GC_cage_base;
+#endif
+  *base = (ptr_t)address;
+  block = HBLKPTR(*base);
+  hhdr = HDR(block);
+  if (IS_FORWARDING_ADDR_OR_NIL(hhdr) || HBLK_IS_FREE(hhdr)
+      || IS_UNCOLLECTABLE(hhdr->hb_obj_kind) || hhdr->hb_block != block)
+    return NULL;
+  offset = (size_t)(*base - (ptr_t)block);
+  size = hhdr->hb_sz;
+  if (size == 0 || offset % size != 0
+      || (size > HBLKSIZE ? offset != 0 : offset > HBLKSIZE - size))
+    return NULL;
+  bit = MARK_BIT_NO(offset, size);
+  if (bit >= FINAL_MARK_BIT(size) || !mark_bit_from_hdr(hhdr, bit))
+    return NULL;
+  return hhdr;
+}
+
+STATIC void
+GC_clear_young_log_marks(void)
+{
+  size_t i;
+  for (i = 0; i < GC_young_log_count; ++i) {
+    ptr_t base;
+    if (GC_current_young_log_mark(i, &base) != NULL) {
+      GC_clear_mark_bit_inner(base, FALSE);
+      ++GC_young_log_cleared;
+    }
+  }
+  GC_young_log_count = 0;
+  if (GC_young_log_blocks != NULL)
+    BZERO(GC_young_log_blocks, GC_YOUNG_LOG_BLOCK_WORDS * sizeof(word));
+}
+
+GC_INNER void
+GC_finish_young_log(void)
+{
+  size_t i, count = 0;
+  if (!GC_young_log_retrace || GC_young_log_failed)
+    return;
+  {
+    const char *setting = GETENV("GC_GENERATIONAL_LOG_COMPACT");
+    if (setting != NULL && atoi(setting) == 0)
+      return;
+  }
+  for (i = 0; i < GC_young_log_count; ++i) {
+    ptr_t base;
+    if (GC_current_young_log_mark(i, &base) != NULL)
+      GC_young_log_entries[count++] = GC_young_log_entries[i];
+  }
+  GC_young_log_compacted += GC_young_log_count - count;
+  GC_young_log_count = count;
+}
+
+
+#if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+#  define GC_YOUNG_DENSE_WORDS (MARK_BITS_PER_HBLK / CPP_WORDSZ)
+typedef struct {
+  ptr_t start;
+  size_t bytes;
+  word *marks;
+} GC_young_dense_section;
+
+STATIC MAY_THREAD_LOCAL GC_young_dense_section *GC_young_dense_sections;
+STATIC MAY_THREAD_LOCAL size_t GC_young_dense_count;
+STATIC MAY_THREAD_LOCAL size_t GC_young_dense_last;
+
+STATIC void
+GC_release_dense_baseline(void)
+{
+  size_t i;
+  for (i = 0; i < GC_young_dense_count; ++i)
+    free(GC_young_dense_sections[i].marks);
+  free(GC_young_dense_sections);
+  GC_young_dense_sections = NULL;
+  GC_young_dense_count = GC_young_dense_last = 0;
+}
+
+/* This census owns its section map independently of the protection cache.
+   A late heap section is young; losing an existing mapping is not. */
+STATIC GC_bool
+GC_dense_sections_valid(void)
+{
+  size_t i;
+  if (GC_young_dense_count > GC_n_heap_sects)
+    return FALSE;
+  for (i = 0; i < GC_young_dense_count; ++i)
+    if (GC_young_dense_sections[i].start != GC_heap_sects[i].hs_start
+        || GC_young_dense_sections[i].bytes != GC_heap_sects[i].hs_bytes)
+      return FALSE;
+  return TRUE;
+}
+
+STATIC word *
+GC_dense_old_marks(const struct hblk *block)
+{
+  size_t i = GC_young_dense_last, remaining = GC_young_dense_count;
+  while (remaining-- != 0) {
+    GC_young_dense_section *section = &GC_young_dense_sections[i];
+    if (ADDR_GE((ptr_t)block, section->start)
+        && (size_t)((ptr_t)block - section->start) < section->bytes) {
+      GC_young_dense_last = i;
+      return section->marks
+             + ((size_t)((ptr_t)block - section->start) / HBLKSIZE)
+                   * GC_YOUNG_DENSE_WORDS;
+    }
+    if (++i == GC_young_dense_count)
+      i = 0;
+  }
+  return NULL;
+}
+
+STATIC void GC_CALLBACK
+GC_capture_dense_marks(struct hblk *block, void *data)
+{
+  const hdr *hhdr = HDR(block);
+  word *marks;
+  size_t last_bit;
+
+  UNUSED_ARG(data);
+  if (IS_UNCOLLECTABLE(hhdr->hb_obj_kind) || hhdr->hb_n_marks == 0)
+    return;
+  marks = GC_dense_old_marks(block);
+  GC_ASSERT(marks != NULL);
+  BCOPY(CAST_AWAY_VOLATILE_PVOID(hhdr->hb_marks), marks,
+        GC_YOUNG_DENSE_WORDS * sizeof(word));
+  last_bit = FINAL_MARK_BIT(hhdr->hb_sz);
+  if (last_bit < MARK_BITS_PER_HBLK)
+    marks[divWORDSZ(last_bit)] &= ~((word)1 << modWORDSZ(last_bit));
+}
+
+STATIC GC_bool
+GC_capture_dense_baseline(void)
+{
+  size_t i, bytes = 0;
+
+  if (GC_young_dense_count != GC_n_heap_sects || !GC_dense_sections_valid())
+    GC_release_dense_baseline();
+  if (GC_young_dense_sections == NULL) {
+    GC_young_dense_sections = (GC_young_dense_section *)calloc(
+        GC_n_heap_sects, sizeof(*GC_young_dense_sections));
+    if (GC_young_dense_sections == NULL)
+      return FALSE;
+    GC_young_dense_count = GC_n_heap_sects;
+    for (i = 0; i < GC_young_dense_count; ++i) {
+      GC_young_dense_sections[i].start = GC_heap_sects[i].hs_start;
+      GC_young_dense_sections[i].bytes = GC_heap_sects[i].hs_bytes;
+    }
+  }
+  for (i = 0; i < GC_young_dense_count; ++i) {
+    GC_young_dense_section *section = &GC_young_dense_sections[i];
+    size_t size = section->bytes / HBLKSIZE
+                  * GC_YOUNG_DENSE_WORDS * sizeof(word);
+    if (section->marks == NULL) {
+      section->marks = (word *)calloc(1, size);
+      if (section->marks == NULL) {
+        GC_release_dense_baseline();
+        GC_young_snapshot_bytes = 0;
+        return FALSE;
+      }
+    } else {
+      BZERO(section->marks, size);
+    }
+    bytes += size;
+  }
+  GC_young_dense_last = 0;
+  GC_apply_to_all_blocks(GC_capture_dense_marks, NULL);
+  GC_young_snapshot_bytes = bytes
+                           + GC_young_dense_count * sizeof(*GC_young_dense_sections);
+  return TRUE;
+}
+
+/* Keep only current marks at addresses present in the old census.  An old
+   address reused with another layout can promote extra cells, but cannot
+   install marks for cells which do not exist in the current layout. */
+STATIC void
+GC_intersect_dense_marks(hdr *hhdr, const word *old)
+{
+  size_t i, last_bit = FINAL_MARK_BIT(hhdr->hb_sz);
+  size_t removed_count = 0;
+
+  if (old == NULL) {
+    GC_clear_hdr_marks(hhdr);
+    return;
+  }
+  for (i = 0; i < GC_YOUNG_DENSE_WORDS; ++i) {
+    word current = hhdr->hb_marks[i];
+    word keep = current & old[i];
+    word removed;
+    if (i == divWORDSZ(last_bit))
+      keep |= (word)1 << modWORDSZ(last_bit);
+    removed = current & ~keep;
+    if (removed != 0) {
+#  if defined(__GNUC__) || defined(__clang__)
+      removed_count += (size_t)__builtin_popcountll(removed);
+#  else
+      do {
+        ++removed_count;
+        removed &= removed - 1;
+      } while (removed != 0);
+#  endif
+    }
+    if (keep != current)
+      hhdr->hb_marks[i] = keep;
+  }
+  GC_ASSERT(removed_count <= hhdr->hb_n_marks);
+  hhdr->hb_n_marks -= removed_count;
+}
+#endif
+
+GC_INNER GC_bool
+GC_young_block_is_old(const hdr *hhdr)
+{
+  return IS_UNCOLLECTABLE(hhdr->hb_obj_kind)
+         || (GC_young_old_block_map != NULL
+             && get_pht_entry_from_index(GC_young_old_block_map,
+                                         PHT_HASH(hhdr->hb_block)) != 0);
+}
+
+STATIC GC_bool
+GC_young_clear_requires_full(const hdr *hhdr, size_t bit_no)
+{
+  GC_bool required = GC_young_baseline_pending
+         || (GC_young_log_retrace && GC_young_old_valid
+             && !IS_UNCOLLECTABLE(hhdr->hb_obj_kind))
+         || (GC_young_block_retrace && GC_young_old_valid
+             && !IS_UNCOLLECTABLE(hhdr->hb_obj_kind)
+             && GC_young_block_is_old(hhdr));
+#if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+  if (!required && GC_young_dense_retrace && GC_young_old_valid
+      && !IS_UNCOLLECTABLE(hhdr->hb_obj_kind)
+      && bit_no < MARK_BITS_PER_HBLK) {
+    const word *old = GC_dense_old_marks(hhdr->hb_block);
+    required = old != NULL
+               && (old[divWORDSZ(bit_no)] & ((word)1 << modWORDSZ(bit_no))) != 0;
+  }
+#else
+  UNUSED_ARG(bit_no);
+#endif
+  return required;
+}
+
+STATIC void
+GC_invalidate_young_baseline(void)
+{
+  GC_young_baseline_pending = GC_young_old_valid = FALSE;
+  GC_young_old_count = 0;
+  GC_young_log_count = 0;
+  GC_young_log_recording = FALSE;
+}
+
+GC_INNER void
+GC_defer_young_baseline(void)
+{
+  if (GC_young_log_retrace) {
+    GC_release_young_log();
+    GC_young_snapshot_bytes = 0;
+  }
+  /* A full epoch which never used its census need not retain its capacity.
+     Keep storage across productive epochs to avoid repeated large mallocs. */
+  if (!GC_young_captured_since_full && GC_young_old_entries != NULL) {
+    free(GC_young_old_entries);
+    GC_young_old_entries = NULL;
+    GC_young_old_capacity = 0;
+    GC_young_snapshot_bytes = 0;
+  }
+  if (!GC_young_captured_since_full && GC_young_old_block_map != NULL) {
+    free(GC_young_old_block_map);
+    GC_young_old_block_map = NULL;
+    GC_young_snapshot_bytes = 0;
+  }
+#if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+  if (!GC_young_captured_since_full && GC_young_dense_sections != NULL) {
+    GC_release_dense_baseline();
+    GC_young_snapshot_bytes = 0;
+  }
+#endif
+  GC_young_captured_since_full = FALSE;
+  GC_invalidate_young_baseline();
+  GC_young_baseline_pending = GC_young_full_was_tracked;
+  GC_young_baseline_gc_no = GC_gc_no;
+  GC_young_retained_bytes = 0;
+}
+GC_INNER MAY_THREAD_LOCAL word GC_young_retrace_restores;
+GC_INNER MAY_THREAD_LOCAL word GC_young_retrace_rejections;
+
+STATIC void GC_CALLBACK
+GC_count_old_entries(struct hblk *block, void *data)
+{
+  const hdr *hhdr = HDR(block);
+  if (!IS_UNCOLLECTABLE(hhdr->hb_obj_kind) && hhdr->hb_n_marks != 0)
+    ++*(size_t *)data;
+}
+
+static void GC_CALLBACK
+GC_capture_old_block(struct hblk *block, void *data)
+{
+  const hdr *hhdr = HDR(block);
+
+  UNUSED_ARG(data);
+  if (!IS_UNCOLLECTABLE(hhdr->hb_obj_kind) && hhdr->hb_n_marks != 0)
+    set_pht_entry_from_index(GC_young_old_block_map, PHT_HASH(block));
+}
+
+STATIC void GC_CALLBACK
+GC_capture_old_entry(struct hblk *block, void *data)
+{
+  hdr *hhdr = HDR(block);
+  GC_young_old_entry *entry;
+
+  UNUSED_ARG(data);
+  if (IS_UNCOLLECTABLE(hhdr->hb_obj_kind) || hhdr->hb_n_marks == 0)
+    return;
+  GC_ASSERT(GC_young_old_count < GC_young_old_capacity);
+  entry = &GC_young_old_entries[GC_young_old_count++];
+  entry->block = block;
+  entry->header = hhdr;
+  entry->size = hhdr->hb_sz;
+  entry->descriptor = hhdr->hb_descr;
+  entry->n_marks = hhdr->hb_n_marks;
+  entry->kind = hhdr->hb_obj_kind;
+  entry->flags = hhdr->hb_flags;
+  BCOPY(CAST_AWAY_VOLATILE_PVOID(hhdr->hb_marks), entry->marks,
+        sizeof(entry->marks));
+}
+
+STATIC int
+GC_compare_old_entries(const void *left, const void *right)
+{
+  const GC_young_old_entry *a = (const GC_young_old_entry *)left;
+  const GC_young_old_entry *b = (const GC_young_old_entry *)right;
+  return ADDR_LT(a->block, b->block) ? -1
+         : ADDR_LT(b->block, a->block) ? 1 : 0;
+}
+
+STATIC const GC_young_old_entry *
+GC_find_old_entry(const struct hblk *block)
+{
+  size_t low = 0, high = GC_young_old_count;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (ADDR_LT(GC_young_old_entries[mid].block, block))
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  return low < GC_young_old_count && GC_young_old_entries[low].block == block
+             ? &GC_young_old_entries[low] : NULL;
+}
+
+STATIC void
+GC_capture_young_baseline(void)
+{
+  size_t count = 0;
+  GC_young_old_entry *entries;
+
+  GC_young_old_valid = FALSE;
+  GC_young_retained_bytes = 0;
+  if (!GC_young_full_was_tracked)
+    return;
+  if (GC_young_log_retrace) {
+    if (GC_young_log_blocks == NULL)
+      GC_young_log_blocks = (word *)calloc(GC_YOUNG_LOG_BLOCK_WORDS, sizeof(word));
+    if (GC_young_log_blocks == NULL)
+      return;
+    BZERO(GC_young_log_blocks, GC_YOUNG_LOG_BLOCK_WORDS * sizeof(word));
+    GC_young_snapshot_bytes = GC_YOUNG_LOG_BLOCK_WORDS * sizeof(word);
+    GC_young_old_valid = GC_young_captured_since_full = TRUE;
+    ++GC_young_baseline_captures;
+    return;
+  }
+#if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+  if (GC_young_dense_retrace) {
+    if (!GC_capture_dense_baseline())
+      return;
+    GC_young_old_valid = GC_young_captured_since_full = TRUE;
+    ++GC_young_baseline_captures;
+    return;
+  }
+#endif
+  if (GC_young_block_retrace) {
+    if (GC_young_old_block_map == NULL) {
+      GC_young_old_block_map = (word *)calloc(PHT_SIZE, sizeof(word));
+      if (GC_young_old_block_map == NULL)
+        return;
+    } else {
+      BZERO(GC_young_old_block_map, sizeof(page_hash_table));
+    }
+    /* A collision only promotes an extra block.  No saved mark bits or
+       layouts are ever installed in a reused header. */
+    GC_apply_to_all_blocks(GC_capture_old_block, NULL);
+    GC_young_snapshot_bytes = sizeof(page_hash_table);
+    GC_young_old_valid = GC_young_captured_since_full = TRUE;
+    ++GC_young_baseline_captures;
+    return;
+  }
+  GC_apply_to_all_blocks(GC_count_old_entries, &count);
+  if (count > GC_young_old_capacity) {
+    if (count > GC_SIZE_MAX / sizeof(*entries))
+      return;
+    entries = (GC_young_old_entry *)realloc(
+        GC_young_old_entries, count * sizeof(*entries));
+    if (entries == NULL)
+      return;
+    GC_young_old_entries = entries;
+    GC_young_old_capacity = count;
+  }
+  GC_young_snapshot_bytes = GC_young_old_capacity * sizeof(*entries);
+  GC_young_old_count = 0;
+  GC_apply_to_all_blocks(GC_capture_old_entry, NULL);
+  if (GC_young_old_count > 1)
+    qsort(GC_young_old_entries, GC_young_old_count, sizeof(*entries),
+          GC_compare_old_entries);
+  GC_young_old_valid = TRUE;
+  GC_young_captured_since_full = TRUE;
+  ++GC_young_baseline_captures;
+}
+
+STATIC void GC_CALLBACK
+GC_restore_old_entry(struct hblk *block, void *data)
+{
+  hdr *hhdr = HDR(block);
+  const GC_young_old_entry *entry;
+
+  UNUSED_ARG(data);
+  if (IS_UNCOLLECTABLE(hhdr->hb_obj_kind))
+    return;
+#if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+  if (GC_young_dense_retrace) {
+    GC_intersect_dense_marks(hhdr, GC_dense_old_marks(block));
+    GC_ASSERT(hhdr->hb_n_marks == GC_n_set_marks(hhdr));
+    return;
+  }
+#endif
+  if (GC_young_block_retrace) {
+    if (!GC_young_block_is_old(hhdr))
+      GC_clear_hdr_marks(hhdr);
+    GC_ASSERT(hhdr->hb_n_marks == GC_n_set_marks(hhdr));
+    return;
+  }
+  entry = GC_find_old_entry(block);
+  if (entry == NULL) {
+    GC_clear_hdr_marks(hhdr);
+  } else {
+    BCOPY(entry->marks, CAST_AWAY_VOLATILE_PVOID(hhdr->hb_marks),
+          sizeof(entry->marks));
+    hhdr->hb_n_marks = entry->n_marks;
+  }
+  GC_ASSERT(hhdr->hb_n_marks == GC_n_set_marks(hhdr));
+}
+
+/* A pending block with no marks outside the old census loses no marked
+   live object on restore.  Its lazy sweep can remain pending: allocation
+   normally sweeps and removes such a block before handing out its cells. */
+GC_INNER GC_bool
+GC_young_pending_reclaim_safe(const hdr *hhdr)
+{
+  const GC_young_old_entry *entry;
+  const unsigned char *current;
+  size_t i;
+
+  if (IS_UNCOLLECTABLE(hhdr->hb_obj_kind))
+    return TRUE;
+  if (GC_young_log_retrace)
+    return GC_young_log_count == 0
+           || !get_pht_entry_from_index(GC_young_log_blocks,
+                                        GC_YOUNG_LOG_HASH(hhdr->hb_block));
+#if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+  if (GC_young_dense_retrace) {
+    const word *old = GC_dense_old_marks(hhdr->hb_block);
+    size_t last_bit = FINAL_MARK_BIT(hhdr->hb_sz);
+    if (old == NULL)
+      return FALSE;
+    for (i = 0; i < GC_YOUNG_DENSE_WORDS; ++i) {
+      word outside = hhdr->hb_marks[i] & ~old[i];
+      if (i == divWORDSZ(last_bit))
+        outside &= ~((word)1 << modWORDSZ(last_bit));
+      if (outside != 0)
+        return FALSE;
+    }
+    return TRUE;
+  }
+#endif
+  if (GC_young_block_retrace)
+    return GC_young_block_is_old(hhdr);
+  entry = GC_find_old_entry(hhdr->hb_block);
+  if (entry == NULL || hhdr != entry->header || hhdr->hb_sz != entry->size
+      || hhdr->hb_descr != entry->descriptor || hhdr->hb_obj_kind != entry->kind
+      || hhdr->hb_flags != entry->flags)
+    return FALSE;
+  current = (const unsigned char *)CAST_AWAY_VOLATILE_PVOID(hhdr->hb_marks);
+  for (i = 0; i < sizeof(entry->marks); ++i)
+    if ((current[i] & ~entry->marks[i]) != 0)
+      return FALSE;
+  return TRUE;
+}
+
+/* Pending reclaim lists must consume the still-valid previous marks before
+   a young survivor is made white again.  In particular an aborted trace's
+   full fallback must not lazily reclaim an unvisited, live young object. */
+GC_INNER GC_ATTR_NOINLINE GC_bool
+GC_prepare_young_retrace(void)
+{
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+  size_t i;
+  GC_bool valid = TRUE;
+
+  if (GC_young_log_retrace && GC_young_log_failed) {
+    ++GC_young_retrace_rejections;
+    return FALSE;
+  }
+  if ((!GC_young_old_valid && !GC_young_baseline_pending)
+      || !GC_incremental || GC_manual_vdb
+      || GC_get_actual_vdb() != GC_VDB_MPROTECT
+      || GC_isolate_vdb_has_foreign_writes())
+    return FALSE;
+#  ifdef PARALLEL_MARK
+  if (GC_parallel)
+    return FALSE;
+#  endif
+  ++GC_dont_gc;
+  if (GC_young_baseline_pending) {
+    if (GC_young_baseline_gc_no != GC_gc_no || GC_mark_state != MS_NONE) {
+      GC_invalidate_young_baseline();
+    } else {
+      GC_young_baseline_pending = FALSE;
+      /* No collection has changed the full marks. Newly allocated cells
+         remain white; explicit set-mark may only conservatively promote. */
+      GC_capture_young_baseline();
+    }
+  }
+  if (!GC_young_old_valid) {
+    ++GC_young_retrace_rejections;
+    --GC_dont_gc;
+    return FALSE;
+  }
+#  if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+  if (GC_young_dense_retrace && !GC_dense_sections_valid()) {
+    ++GC_young_retrace_rejections;
+    --GC_dont_gc;
+    return FALSE;
+  }
+#  endif
+  valid = GC_reclaim_before_young();
+  GC_isolate_vdb_drain_pending();
+  if (!GC_young_old_valid || !GC_young_retrace
+      || GC_isolate_vdb_has_foreign_writes())
+    valid = FALSE;
+#  if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+  if (GC_young_dense_retrace && !GC_dense_sections_valid())
+    valid = FALSE;
+#  endif
+  /* Check every surviving old layout before changing any marks.  A freed
+     address may have been reused or absorbed by another large allocation.
+     A matching reused layout can only conservatively retain extra objects. */
+  for (i = 0; valid && !GC_young_block_retrace && !GC_young_dense_retrace
+              && !GC_young_log_retrace
+              && i < GC_young_old_count; ++i) {
+    const GC_young_old_entry *entry = &GC_young_old_entries[i];
+    hdr *hhdr = HDR(entry->block);
+    if (hhdr == NULL || (!IS_FORWARDING_ADDR_OR_NIL(hhdr)
+                         && HBLK_IS_FREE(hhdr)))
+      continue;
+    if (IS_FORWARDING_ADDR_OR_NIL(hhdr) || hhdr != entry->header
+        || hhdr->hb_sz != entry->size || hhdr->hb_descr != entry->descriptor
+        || hhdr->hb_obj_kind != entry->kind || hhdr->hb_flags != entry->flags)
+      valid = FALSE;
+  }
+  if (valid) {
+    if (GC_young_log_retrace)
+      GC_clear_young_log_marks();
+    else
+      GC_apply_to_all_blocks(GC_restore_old_entry, NULL);
+    ++GC_young_retrace_restores;
+  } else {
+    ++GC_young_retrace_rejections;
+  }
+  --GC_dont_gc;
+  return valid;
+#else
+  return FALSE;
+#endif
+}
+
+GC_INNER void
+GC_young_retrace_deinit(void)
+{
+  GC_target_mark_table_end();
+  if (!GC_is_init_called())
+    return;
+  GC_sparse_sources_deinit();
+  GC_release_young_log();
+  GC_young_log_limit = 1024 * 1024;
+  GC_young_log_events = GC_young_log_overflows = 0;
+  GC_young_log_cleared = GC_young_log_compacted = 0;
+  GC_young_log_max_entries = GC_young_log_max_bytes = 0;
+  if (!GC_young_retrace && GC_young_old_entries == NULL
+      && GC_young_old_block_map == NULL
+#if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+      && GC_young_dense_sections == NULL
+#endif
+  )
+    return;
+#if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+  GC_release_dense_baseline();
+#endif
+  free(GC_young_old_block_map);
+  GC_young_old_block_map = NULL;
+  free(GC_young_old_entries);
+  GC_young_old_entries = NULL;
+  GC_young_old_count = GC_young_old_capacity = 0;
+  GC_young_old_valid = GC_young_full_was_tracked = FALSE;
+  GC_young_baseline_pending = GC_young_captured_since_full = FALSE;
+  GC_young_mark_clear_invalidated = FALSE;
+  GC_young_baseline_gc_no = 0;
+  GC_young_baseline_captures = GC_young_preflight_rejections = 0;
+  GC_young_retrace_restores = GC_young_retrace_rejections = 0;
+  GC_young_pending_kept = GC_young_pending_drained = 0;
+  GC_young_old_source_blocks = GC_young_old_source_empty = 0;
+  GC_young_old_source_recoveries = 0;
+  GC_young_source_recovery_pending = GC_young_source_filter_disabled = FALSE;
+  GC_young_retained_bytes = GC_young_snapshot_bytes = 0;
+#ifndef GC_DISABLE_INCREMENTAL
+  GC_reset_young_remembered(FALSE);
+#endif
+}
+
+
+#ifdef GC_TEST_ZERO_SOURCE_MUTATION
+GC_INNER MAY_THREAD_LOCAL word GC_test_zero_hidden_block;
+GC_INNER MAY_THREAD_LOCAL word GC_test_zero_hidden_child;
+GC_INNER MAY_THREAD_LOCAL word GC_test_zero_hidden_field;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_test_zero_skipped;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_test_zero_child_from_field;
+GC_INNER MAY_THREAD_LOCAL GC_bool GC_test_zero_suppress_mutation;
+#endif
+STATIC MAY_THREAD_LOCAL struct hblk *GC_sparse_current_source;
+GC_INNER MAY_THREAD_LOCAL word GC_sparse_attempts, GC_sparse_cache_hits;
+GC_INNER MAY_THREAD_LOCAL word GC_sparse_captures, GC_sparse_zero_captures;
+GC_INNER MAY_THREAD_LOCAL word GC_sparse_queries, GC_sparse_hits;
+GC_INNER MAY_THREAD_LOCAL word GC_sparse_caps, GC_sparse_oom;
+GC_INNER MAY_THREAD_LOCAL word GC_sparse_layout_fallbacks, GC_sparse_max_entries;
+GC_INNER MAY_THREAD_LOCAL word GC_sparse_mapping_bytes;
+GC_INNER MAY_THREAD_LOCAL word GC_sparse_zero_queries;
+
+#if defined(LINUX) && !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+#define GC_SPARSE_SLOTS 16384
+#define GC_SPARSE_LIMIT (GC_SPARSE_SLOTS / 2)
+#ifdef ESCARGOT_USE_32BIT_IN_64BIT
+#define GC_SPARSE_BITMAP_WORDS \
+  ((size_t)0x100000000ULL / HBLKSIZE / CPP_WORDSZ)
+#endif
+STATIC MAY_THREAD_LOCAL word *GC_sparse_slots;
+STATIC MAY_THREAD_LOCAL size_t GC_sparse_count, GC_sparse_bytes;
+STATIC MAY_THREAD_LOCAL GC_bool GC_sparse_capped;
+STATIC const word GC_sparse_zero_marks[GC_YOUNG_DENSE_WORDS];
+
+STATIC void
+GC_sparse_sources_end(void)
+{
+  GC_marker_cold_arrays._young_sparse_active = FALSE;
+  if (GC_sparse_slots != NULL)
+    (void)munmap(GC_sparse_slots, GC_sparse_bytes);
+  GC_sparse_slots = NULL;
+  GC_sparse_current_source = NULL;
+  GC_sparse_count = 0;
+}
+
+STATIC void
+GC_sparse_sources_begin(void)
+{
+  void *memory;
+  GC_sparse_sources_end();
+  GC_sparse_sources_armed = FALSE;
+  GC_sparse_capped = FALSE;
+  if (!GC_young_mark_active || !GC_young_sparse_sources
+      || GC_young_roots_first || GC_get_actual_vdb() != GC_VDB_MPROTECT)
+    return;
+#ifdef PARALLEL_MARK
+  if (GC_parallel)
+    return;
+#endif
+#ifdef ESCARGOT_USE_32BIT_IN_64BIT
+  GC_sparse_bytes = GC_SPARSE_BITMAP_WORDS * sizeof(word);
+#else
+  GC_sparse_bytes = GC_SPARSE_SLOTS * sizeof(word);
+#endif
+  memory = mmap(NULL, GC_sparse_bytes, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (memory == MAP_FAILED) {
+    ++GC_sparse_oom;
+    return;
+  }
+  GC_sparse_slots = (word *)memory;
+  GC_young_sparse_active = GC_sparse_sources_armed = TRUE;
+  GC_sparse_mapping_bytes = GC_sparse_bytes;
+}
+
+STATIC GC_bool
+GC_sparse_kind_eligible(const hdr *hhdr)
+{
+  if (IS_UNCOLLECTABLE(hhdr->hb_obj_kind) || IS_PTRFREE(hhdr))
+    return FALSE;
+#ifdef ENABLE_DISCLAIM
+  if ((hhdr->hb_flags & (MARK_UNCONDITIONALLY | HAS_DISCLAIM)) != 0
+      || GC_obj_kinds[hhdr->hb_obj_kind].ok_disclaim_proc != NULL)
+    return FALSE;
+#endif
+  return TRUE;
+}
+
+#ifndef ESCARGOT_USE_32BIT_IN_64BIT
+STATIC word *
+GC_sparse_find(word key)
+{
+  size_t index = (size_t)(key * (word)2654435761U)
+                 & (GC_SPARSE_SLOTS - 1);
+  while (GC_sparse_slots[index] != 0 && GC_sparse_slots[index] != key)
+    index = (index + 1) & (GC_SPARSE_SLOTS - 1);
+  return &GC_sparse_slots[index];
+}
+#endif
+
+GC_INNER void
+GC_sparse_record_new_mark(const hdr *hhdr, const void *base)
+{
+  struct hblk *block = HBLKPTR(base);
+  word key, *slot;
+#ifdef ESCARGOT_USE_32BIT_IN_64BIT
+  word mask;
+#endif
+  if (!GC_young_sparse_active || GC_sparse_capped || hhdr->hb_n_marks != 1
+      || GC_mark_state != MS_PUSH_RESCUERS || !GC_sparse_kind_eligible(hhdr))
+    return;
+  if (GC_sparse_current_source != NULL) {
+    if (!ADDR_LT(GC_sparse_current_source, block))
+      return;
+  } else if (GC_scan_ptr != NULL && ADDR_LT(block, GC_scan_ptr)) {
+    return;
+  }
+  ++GC_sparse_attempts;
+#ifdef ESCARGOT_USE_32BIT_IN_64BIT
+  if (ADDR(block) < GC_cage_base
+      || ADDR(block) - GC_cage_base >= (word)0x100000000ULL)
+    return;
+  key = (ADDR(block) - GC_cage_base) / HBLKSIZE;
+  slot = &GC_sparse_slots[divWORDSZ(key)];
+  mask = (word)1 << modWORDSZ(key);
+  if ((*slot & mask) != 0)
+    return;
+  *slot |= mask;
+#else
+  key = ADDR(block) / HBLKSIZE + 1;
+  slot = GC_sparse_find(key);
+  if (*slot == key)
+    return;
+  if (GC_sparse_count == GC_SPARSE_LIMIT) {
+    GC_sparse_capped = TRUE;
+    ++GC_sparse_caps;
+    return;
+  }
+  *slot = key;
+#endif
+  ++GC_sparse_count;
+  ++GC_sparse_captures;
+  ++GC_sparse_zero_captures;
+  if (GC_sparse_max_entries < GC_sparse_count)
+    GC_sparse_max_entries = GC_sparse_count;
+}
+
+STATIC const word *
+GC_sparse_old_marks(struct hblk *block, const hdr *hhdr)
+{
+  word key;
+  if (!GC_young_sparse_active || GC_young_source_filter_disabled
+      || !GC_sparse_kind_eligible(hhdr))
+    return NULL;
+  ++GC_sparse_queries;
+#ifdef ESCARGOT_USE_32BIT_IN_64BIT
+  if (ADDR(block) < GC_cage_base
+      || ADDR(block) - GC_cage_base >= (word)0x100000000ULL)
+    return NULL;
+  key = (ADDR(block) - GC_cage_base) / HBLKSIZE;
+  if ((GC_sparse_slots[divWORDSZ(key)] & ((word)1 << modWORDSZ(key))) == 0)
+    return NULL;
+#else
+  key = ADDR(block) / HBLKSIZE + 1;
+  if (*GC_sparse_find(key) != key)
+    return NULL;
+#endif
+  ++GC_sparse_hits;
+  ++GC_sparse_zero_queries;
+#ifdef GC_TEST_ZERO_SOURCE_MUTATION
+  if (GC_test_zero_hidden_block == ~ADDR(block))
+    GC_test_zero_skipped = TRUE;
+#endif
+  return GC_sparse_zero_marks;
+}
+#else
+STATIC void GC_sparse_sources_end(void) { GC_young_sparse_active = FALSE; }
+STATIC const word *GC_sparse_old_marks(struct hblk *block, const hdr *hhdr)
+{ UNUSED_ARG(block); UNUSED_ARG(hhdr); return NULL; }
+
+STATIC void GC_sparse_sources_begin(void) { GC_sparse_sources_armed = FALSE; }
+GC_INNER void GC_sparse_record_new_mark(const hdr *hhdr, const void *base)
+{ UNUSED_ARG(hhdr); UNUSED_ARG(base); }
+#endif
+
+GC_INNER void
+GC_sparse_sources_deinit(void)
+{
+  GC_sparse_sources_end();
+  GC_sparse_sources_armed = FALSE;
+  GC_sparse_attempts = GC_sparse_cache_hits = GC_sparse_captures = 0;
+  GC_sparse_zero_captures = GC_sparse_queries = GC_sparse_hits = 0;
+  GC_sparse_caps = GC_sparse_oom = GC_sparse_layout_fallbacks = 0;
+  GC_sparse_max_entries = GC_sparse_mapping_bytes = GC_sparse_zero_queries = 0;
+}
+
+STATIC MAY_THREAD_LOCAL GC_bool GC_young_roots_done = FALSE;
+
+/* A performance filter only: compare like-for-like pointer-bearing payload
+   estimates before paying for a remembered-source scan.  The index returns
+   each allocation once, including large objects spanning dirty pages. */
+STATIC GC_bool
+GC_young_cost_exceeds_live(GC_bool pending)
+{
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+  struct hblk *cursor = NULL, *block;
+  word dirty = 0, limit = GC_composite_in_use;
+
+  if (GC_young_dirty_percent == 0 || limit == 0)
+    return FALSE;
+  if (GC_young_dirty_percent < 100)
+    limit = limit / 100 * GC_young_dirty_percent;
+  if (pending) {
+    GC_isolate_vdb_drain_pending();
+    if (GC_isolate_vdb_has_foreign_writes())
+      return FALSE;
+  }
+  for (;;) {
+    hdr *hhdr;
+    word marks;
+
+    if (!(pending ? GC_next_pending_candidate(cursor, &block)
+                  : GC_next_dirty_candidate(cursor, &block)) || block == NULL)
+      return FALSE;
+    hhdr = HDR(block);
+    marks = hhdr->hb_n_marks;
+    if (marks != 0) {
+      if (hhdr->hb_sz > (limit - dirty) / marks)
+        return TRUE;
+      dirty += marks * hhdr->hb_sz;
+      if (dirty >= limit)
+        return TRUE;
+    }
+    cursor = block + OBJ_SZ_TO_BLOCKS(hhdr->hb_sz);
+  }
+#else
+  return FALSE;
+#endif
+}
+
+GC_INNER GC_bool
+GC_young_pending_cost_exceeds_live(void)
+{
+  return GC_young_cost_exceeds_live(TRUE);
 }
 
 GC_INNER void
@@ -358,6 +1553,15 @@ GC_initiate_gc(void)
   GC_ASSERT(I_HOLD_LOCK());
   GC_ASSERT(GC_is_initialized);
 #ifndef GC_DISABLE_INCREMENTAL
+  if (GC_generational && GC_young_retrace && GC_mark_state == MS_INVALID
+      && !GC_young_mark_active) {
+    /* The first deferred activation has no complete write history.  Its
+       baseline stays invalid until a full mark starts with tracking on. */
+    GC_young_full_was_tracked = GC_incremental
+                                && !GC_admission_skip_protect
+                                && GC_get_actual_vdb() == GC_VDB_MPROTECT;
+    GC_reset_young_remembered(FALSE);
+  }
   if (GC_incremental) {
     GC_isolate_vdb_drain_pending();
 #  ifdef CHECKSUMS
@@ -366,6 +1570,10 @@ GC_initiate_gc(void)
 #  else
     GC_read_dirty(GC_mark_state == MS_INVALID);
 #  endif
+  }
+  {
+    const char *mode = GETENV("GC_BENCH_SOURCE_BATCH");
+    GC_source_batch_mode = mode != NULL ? (unsigned)atoi(mode) : 0;
   }
   GC_n_rescuing_pages = 0;
 #endif
@@ -376,6 +1584,26 @@ GC_initiate_gc(void)
     GC_ASSERT(GC_mark_state == MS_INVALID);
   }
   GC_scan_ptr = NULL;
+  GC_young_roots_done = FALSE;
+  GC_young_source_recovery_pending = GC_young_source_filter_disabled = FALSE;
+  if (GC_young_mark_active) {
+    if (GC_young_retrace && GC_isolate_vdb_has_foreign_writes()) {
+      ++GC_young_retrace_rejections;
+      GC_young_mark_aborted = TRUE;
+    } else if (GC_young_cost_exceeds_live(FALSE)) {
+      ++GC_young_dirty_rejections;
+      GC_young_mark_aborted = TRUE;
+    } else if (GC_young_roots_first) {
+      GC_mark_state = MS_PUSH_ROOTS_FIRST;
+    }
+  }
+  GC_sparse_sources_begin();
+  {
+    const char *audit = GETENV("GC_BENCH_SOURCE_PAGE_AUDIT");
+    const char *slice = GETENV("GC_BENCH_SOURCE_PAGE_SLICE");
+    GC_source_page_audit = audit != NULL && atoi(audit) != 0;
+    GC_source_page_slice = slice != NULL && atoi(slice) != 0;
+  }
 }
 
 #ifdef PARALLEL_MARK
@@ -391,6 +1619,11 @@ STATIC struct hblk *GC_push_next_marked_dirty(struct hblk *h);
 
 STATIC struct hblk *GC_push_next_marked(struct hblk *h);
 STATIC struct hblk *GC_push_next_marked_uncollectable(struct hblk *h);
+#if !defined(GC_DISABLE_INCREMENTAL) && !defined(MARK_BIT_PER_OBJ) \
+    && !defined(USE_MARK_BYTES)
+STATIC void GC_push_marked_word_bits(struct hblk *h, const hdr *hhdr,
+                                      GC_bool old_only, const word *saved);
+#endif
 
 static void alloc_mark_stack(size_t);
 
@@ -442,18 +1675,59 @@ GC_mark_some(ptr_t cold_gc_frame)
 #endif
 {
   GC_ASSERT(I_HOLD_LOCK());
+  if (GC_young_mark_active && GC_young_source_recovery_pending) {
+    GC_young_source_recovery_pending = FALSE;
+    GC_young_source_filter_disabled = TRUE;
+    GC_mark_state = MS_INVALID;
+    GC_scan_ptr = NULL;
+    GC_objects_are_marked = TRUE;
+    ++GC_young_old_source_recoveries;
+  }
+  if (GC_young_sparse_active && GC_mark_state != MS_PUSH_RESCUERS)
+    GC_sparse_sources_end();
   switch (GC_mark_state) {
   case MS_NONE:
     return TRUE;
 
+  case MS_PUSH_ROOTS_FIRST:
+    GC_young_root_marking = TRUE;
+    GC_push_roots(FALSE, cold_gc_frame);
+    GC_young_root_marking = FALSE;
+    GC_objects_are_marked = TRUE;
+    GC_young_roots_done = TRUE;
+    if (GC_mark_state != MS_INVALID)
+      GC_mark_state = MS_TRACE_ROOTS_FIRST;
+    break;
+
+  case MS_TRACE_ROOTS_FIRST:
+    if (ADDR_GE((ptr_t)GC_mark_stack_top, (ptr_t)GC_mark_stack)) {
+      GC_young_root_marking = TRUE;
+      MARK_FROM_MARK_STACK();
+      GC_young_root_marking = FALSE;
+    } else {
+      GC_mark_state = MS_PUSH_RESCUERS;
+      GC_scan_ptr = NULL;
+    }
+    break;
+
   case MS_PUSH_RESCUERS:
+    GC_young_rescuer_marking = GC_young_mark_active;
     if (ADDR_GE((ptr_t)GC_mark_stack_top,
-                (ptr_t)(GC_mark_stack_limit - INITIAL_MARK_STACK_SIZE / 2))) {
+                (ptr_t)(GC_young_mark_active
+                            ? GC_mark_stack + GC_mark_stack_size / 4
+                            : GC_mark_stack_limit
+                                  - INITIAL_MARK_STACK_SIZE / 2))) {
       /*
        * Go ahead and mark, even though that might cause us to see more
        * marked dirty objects later on.  Avoid this in the future.
        */
-      GC_mark_stack_too_small = TRUE;
+      /* Leave room for the closure of dirty sources, including custom
+         mark procedures which may push many children in one call.  A
+         stopped minor can drain this queue without a growth hint; genuine
+         overflow still invalidates marking and requests growth. */
+      if (!GC_young_mark_active) {
+        GC_mark_stack_too_small = TRUE;
+      }
       MARK_FROM_MARK_STACK();
     } else {
       GC_scan_ptr = GC_push_next_marked_dirty(GC_scan_ptr);
@@ -463,8 +1737,17 @@ GC_mark_some(ptr_t cold_gc_frame)
                            (unsigned long)GC_n_rescuing_pages);
       }
 #endif
-      push_roots_and_advance(FALSE, cold_gc_frame);
+      GC_young_rescuer_marking = FALSE;
+      if (GC_scan_ptr == NULL && GC_young_sparse_active)
+        GC_sparse_sources_end();
+      if (GC_young_roots_done) {
+        if (GC_scan_ptr == NULL && GC_mark_state != MS_INVALID)
+          GC_mark_state = MS_ROOTS_PUSHED;
+      } else {
+        push_roots_and_advance(FALSE, cold_gc_frame);
+      }
     }
+    GC_young_rescuer_marking = FALSE;
     GC_ASSERT(GC_mark_state == MS_PUSH_RESCUERS
               || GC_mark_state == MS_ROOTS_PUSHED
               || GC_mark_state == MS_INVALID);
@@ -524,6 +1807,8 @@ GC_mark_some(ptr_t cold_gc_frame)
         if (ADDR_GE((ptr_t)GC_mark_stack_top, (ptr_t)GC_mark_stack))
           break;
       }
+      if (GC_young_mark_active && GC_young_source_recovery_pending)
+        break;
       if (GC_mark_stack_too_small) {
         alloc_mark_stack(2 * GC_mark_stack_size);
       }
@@ -679,7 +1964,7 @@ GC_invalidate_mark_state(void)
   GC_mark_stack_top = GC_mark_stack - 1;
 }
 
-STATIC mse *
+GC_ATTR_NOINLINE STATIC mse *
 GC_signal_mark_stack_overflow(mse *msp)
 {
   GC_mark_state = MS_INVALID;
@@ -727,6 +2012,8 @@ GC_mark_from(mse *mark_stack_top, const mse *mark_stack, mse *mark_stack_limit)
          == 0)
 #endif
   {
+    if (UNLIKELY(GC_young_mark_aborted))
+      break;
     current_p = mark_stack_top->mse_start;
     descr = mark_stack_top->mse_descr;
 #if defined(ESCARGOT_USE_32BIT_IN_64BIT)
@@ -1132,6 +2419,8 @@ GC_mark_and_push_ptrs(mse *mark_stack_ptr,
   ptr_t least_ha = (ptr_t)GC_least_plausible_heap_addr;
   ptr_t greatest_ha = (ptr_t)GC_greatest_plausible_heap_addr;
   for (int j = 0; j < number_of_sub_pointer; j++) {
+    if (UNLIKELY(GC_young_mark_aborted))
+      break;
     ptr_t q = (ptr_t)arr[j].to;
     if (ADDR_LT(least_ha, q) && ADDR_LT(q, greatest_ha)) {
       PREFETCH(q);
@@ -1821,10 +3110,13 @@ GC_API struct GC_ms_entry *GC_CALL
 GC_mark_and_push(void *obj, mse *mark_stack_top, mse *mark_stack_limit,
                  void **src)
 {
-  hdr *hhdr;
+  hdr *hhdr = NULL;
 
   PREFETCH(obj);
-  GET_HDR(obj, hhdr);
+  if (GC_target_probe((ptr_t)obj, &hhdr))
+    return mark_stack_top;
+  if (hhdr == NULL)
+    GET_HDR(obj, hhdr);
   if ((UNLIKELY(IS_FORWARDING_ADDR_OR_NIL(hhdr))
        && (!GC_all_interior_pointers
            || NULL == (hhdr = GC_find_header(GC_base(obj)))))
@@ -2297,6 +3589,14 @@ GC_push_marked(struct hblk *h, const hdr *hhdr)
   case 1: /*< to suppress "switch statement contains no case" warning */
 #endif
   default:
+#if !defined(GC_DISABLE_INCREMENTAL) && !defined(MARK_BIT_PER_OBJ) \
+    && !defined(USE_MARK_BYTES)
+    if (GC_young_mark_active && GC_young_marked_bits
+        && !IS_UNCOLLECTABLE(hhdr->hb_obj_kind)) {
+      GC_push_marked_word_bits(h, hhdr, FALSE, NULL);
+      break;
+    }
+#endif
     plim = sz > MAXOBJBYTES ? h->hb_body
                             : CAST_THRU_UINTPTR(ptr_t, (h + 1)->hb_body) - sz;
     mark_stack_top = GC_mark_stack_top;
@@ -2403,31 +3703,263 @@ GC_push_next_marked(struct hblk *h)
 }
 
 #ifndef GC_DISABLE_INCREMENTAL
+/* Young objects are traced on their first mark.  Rescuing them again from
+   dirty pages duplicates that work, including cells mixed into old blocks.
+   Only old starts need remembered-source scans; retain current descriptors. */
+#  if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+#include "source-batch.inc"
+
+STATIC void
+GC_push_marked_word_bits(struct hblk *h, const hdr *hhdr, GC_bool old_only,
+                           const word *saved)
+{
+  const word *old = NULL;
+  size_t i, last_bit;
+  mse *top;
+  GC_bool pushed = FALSE;
+
+  if (hhdr->hb_descr == 0 || GC_block_empty(hhdr))
+    return;
+  if (old_only) {
+    ++GC_young_old_source_blocks;
+    old = saved != NULL ? saved : GC_dense_old_marks(h);
+    if (old == NULL) {
+      ++GC_young_old_source_empty;
+      return;
+    }
+  } else {
+    ++GC_young_bit_source_blocks;
+  }
+#if defined(ESCARGOT_USE_32BIT_IN_64BIT)
+  if (!old_only && GC_scan_compressed_sources(h, hhdr))
+    return;
+#endif
+  top = GC_mark_stack_top;
+  last_bit = FINAL_MARK_BIT(hhdr->hb_sz);
+  for (i = 0; i < GC_YOUNG_DENSE_WORDS; ++i) {
+    word bits = hhdr->hb_marks[i];
+    if (old_only)
+      bits &= old[i];
+    if (i == divWORDSZ(last_bit))
+      bits &= ~((word)1 << modWORDSZ(last_bit));
+    while (bits != 0) {
+      size_t bit;
+#    if defined(__GNUC__) || defined(__clang__)
+      bit = (size_t)__builtin_ctzll(bits);
+#    else
+      word remaining = bits;
+      for (bit = 0; (remaining & 1) == 0; ++bit)
+        remaining >>= 1;
+#    endif
+      bits &= bits - 1;
+      top = GC_ms_push_obj_hdr(h->hb_body
+                                   + (i * CPP_WORDSZ + bit) * GC_GRANULE_BYTES,
+                              hhdr, top, GC_mark_stack_limit);
+      pushed = TRUE;
+    }
+  }
+  GC_mark_stack_top = top;
+  if (pushed && old_only) {
+    ++GC_n_rescuing_pages;
+    GC_objects_are_marked = TRUE;
+  } else if (!pushed && old_only) {
+    ++GC_young_old_source_empty;
+  }
+}
+#  endif
+
+/* A marked old large length object needs to rescue references only from
+   pages written since the previous trace.  This is a source-only filter:
+   first marks still enqueue the complete descriptor.  Require the existing
+   callback-mutation recovery to be armed; its invalid-mark fallback rescans
+   whole objects without this filter.  Non-length/custom kinds retain their
+   original descriptor, including any derived referents. */
+STATIC GC_bool
+GC_push_dirty_large_length(struct hblk *h, const hdr *hhdr)
+{
+#if defined(ESCARGOT_USE_32BIT_IN_64BIT) && defined(LINUX)
+  size_t bytes, offset;
+  unsigned format;
+  ptr_t run = NULL;
+  mse *top;
+  GC_bool pushed = FALSE;
+
+  if (!GC_source_page_slice || !GC_young_mark_active
+      || GC_mark_state != MS_PUSH_RESCUERS || !GC_sparse_sources_armed
+      || GC_young_source_filter_disabled || GC_page_size != HBLKSIZE
+      || GC_get_actual_vdb() != GC_VDB_MPROTECT
+      || hhdr->hb_sz <= HBLKSIZE || !GC_sparse_kind_eligible(hhdr)
+      || (hhdr->hb_descr & GC_DS_TAGS) != GC_DS_LENGTH
+      || hhdr->hb_descr == 0 || hhdr->hb_descr > hhdr->hb_sz)
+    return FALSE;
+  format = hhdr->hb_flags & COMPRESSED_FORMAT_MASK;
+  if ((format != 0 && format != COMPRESSED_POINTERS)
+      || (format == 0 && ALIGNMENT != sizeof(ptr_t)))
+    return FALSE;
+  if (!mark_bit_from_hdr(hhdr, 0))
+    return TRUE;
+  bytes = hhdr->hb_descr;
+  top = GC_mark_stack_top;
+  ++GC_source_page_stats[16];
+  GC_source_page_stats[17] += bytes;
+  for (offset = 0; offset < bytes; offset += HBLKSIZE) {
+    ptr_t page = (ptr_t)h + offset;
+    size_t part = bytes - offset;
+    if (part > HBLKSIZE)
+      part = HBLKSIZE;
+    if (GC_page_was_dirty((const struct hblk *)page)) {
+      if (run == NULL)
+        run = page;
+      GC_source_page_stats[18] += part;
+    } else if (run != NULL) {
+      size_t length = (size_t)(page - run);
+      top = format == COMPRESSED_POINTERS
+                ? GC_push_32bit_range(run, length, top, GC_mark_stack_limit)
+                : GC_ms_push_obj_descr(run, (word)length, top,
+                                        GC_mark_stack_limit);
+      ++GC_source_page_stats[19];
+      pushed = TRUE;
+      run = NULL;
+    }
+  }
+  if (run != NULL) {
+    size_t length = (size_t)((ptr_t)h + bytes - run);
+    top = format == COMPRESSED_POINTERS
+              ? GC_push_32bit_range(run, length, top, GC_mark_stack_limit)
+              : GC_ms_push_obj_descr(run, (word)length, top,
+                                      GC_mark_stack_limit);
+    ++GC_source_page_stats[19];
+    pushed = TRUE;
+  }
+  GC_mark_stack_top = top;
+  if (pushed) {
+    ++GC_n_rescuing_pages;
+    GC_objects_are_marked = TRUE;
+  }
+  return TRUE;
+#else
+  UNUSED_ARG(h);
+  UNUSED_ARG(hhdr);
+  return FALSE;
+#endif
+}
+
+/* Diagnostic only: payload estimates and exact dirty coverage of plain
+   large length descriptors.  Counters do not affect marking decisions. */
+STATIC void
+GC_audit_dirty_source(struct hblk *h, const hdr *hhdr)
+{
+  size_t size = hhdr->hb_sz;
+  word objects;
+  unsigned category;
+  if (hhdr->hb_descr == 0 || GC_block_empty(hhdr))
+    return;
+  if (size <= MAXOBJBYTES) {
+    GC_source_page_stats[0]++;
+    GC_source_page_stats[1] += size * hhdr->hb_n_marks;
+    return;
+  }
+  if (!mark_bit_from_hdr(hhdr, 0))
+    return;
+  category = 2 + (hhdr->hb_descr & GC_DS_TAGS) * 2;
+  ++GC_source_page_stats[category];
+  GC_source_page_stats[category + 1] += size;
+  if ((hhdr->hb_descr & GC_DS_TAGS) != GC_DS_LENGTH
+      || hhdr->hb_descr > size)
+    return;
+  objects = 0;
+#if defined(ESCARGOT_USE_32BIT_IN_64BIT)
+  objects = hhdr->hb_flags & COMPRESSED_FORMAT_MASK;
+  if (objects != 0 && objects != COMPRESSED_POINTERS)
+    return;
+#endif
+  {
+    size_t offset, bytes = hhdr->hb_descr;
+    word dirty_bytes = 0;
+    for (offset = 0; offset < bytes; offset += HBLKSIZE) {
+      size_t part = bytes - offset;
+      if (part > HBLKSIZE)
+        part = HBLKSIZE;
+      if (GC_page_was_dirty((const struct hblk *)((ptr_t)h + offset)))
+        dirty_bytes += part;
+    }
+    ++GC_source_page_stats[10];
+    GC_source_page_stats[11] += bytes;
+    GC_source_page_stats[12] += dirty_bytes;
+#if defined(ESCARGOT_USE_32BIT_IN_64BIT)
+    if (objects == COMPRESSED_POINTERS) {
+      GC_source_page_stats[13]++;
+      GC_source_page_stats[14] += bytes;
+      GC_source_page_stats[15] += dirty_bytes;
+    }
+#endif
+  }
+}
+
 /* Identical to `GC_push_next_marked`, but mark only from dirty pages. */
 STATIC struct hblk *
 GC_push_next_marked_dirty(struct hblk *h)
 {
   const hdr *hhdr;
+  GC_bool indexed = FALSE;
 
   GC_ASSERT(I_HOLD_LOCK());
   if (!GC_incremental)
     ABORT("Dirty bits not set up");
-  for (;; h += OBJ_SZ_TO_BLOCKS(hhdr->hb_sz)) {
-    hhdr = HDR(h);
-    if (UNLIKELY(IS_FORWARDING_ADDR_OR_NIL(hhdr) || HBLK_IS_FREE(hhdr))) {
-      h = GC_next_block(h, FALSE);
-      if (NULL == h)
-        return NULL;
-      hhdr = GC_find_header(h);
-    } else {
-#  ifdef LINT2
-      if (NULL == h)
-        ABORT("Bad HDR() definition");
-#  endif
+#  if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+  {
+#    if defined(GC_ASSERTIONS) || !defined(NDEBUG)
+    struct hblk *reference = h;
+#    endif
+    indexed = GC_next_dirty_candidate(h, &h);
+#    if defined(GC_ASSERTIONS) || !defined(NDEBUG)
+    if (indexed) {
+      const hdr *reference_hdr;
+      for (;;) {
+        reference_hdr = HDR(reference);
+        if (IS_FORWARDING_ADDR_OR_NIL(reference_hdr)
+            || HBLK_IS_FREE(reference_hdr)) {
+          reference = GC_next_block(reference, FALSE);
+          if (reference == NULL)
+            break;
+          reference_hdr = HDR(reference);
+        }
+        if (!IS_PTRFREE(reference_hdr)
+            && GC_block_was_dirty(reference, reference_hdr))
+          break;
+        reference += OBJ_SZ_TO_BLOCKS(reference_hdr->hb_sz);
+      }
+      if (reference != h)
+        ABORT("Dirty candidate index differs from block headers");
     }
-    if (GC_block_was_dirty(h, hhdr))
-      break;
+#    endif
   }
+#  endif
+  if (indexed) {
+    if (h == NULL)
+      return NULL;
+    hhdr = HDR(h);
+  } else {
+    for (;; h += OBJ_SZ_TO_BLOCKS(hhdr->hb_sz)) {
+      hhdr = HDR(h);
+      if (UNLIKELY(IS_FORWARDING_ADDR_OR_NIL(hhdr) || HBLK_IS_FREE(hhdr))) {
+        h = GC_next_block(h, FALSE);
+        if (NULL == h)
+          return NULL;
+        hhdr = GC_find_header(h);
+      } else {
+#  ifdef LINT2
+        if (NULL == h)
+          ABORT("Bad HDR() definition");
+#  endif
+      }
+      if (GC_block_was_dirty(h, hhdr))
+        break;
+    }
+  }
+  if (GC_young_mark_active && GC_source_page_audit)
+    GC_audit_dirty_source(h, hhdr);
+  GC_sparse_current_source = h;
 #  ifdef ENABLE_DISCLAIM
   if ((hhdr->hb_flags & MARK_UNCONDITIONALLY) != 0) {
     GC_push_unconditionally(h, hhdr);
@@ -2443,8 +3975,24 @@ GC_push_next_marked_dirty(struct hblk *h)
   } else
 #  endif
   /* else */ {
-    GC_push_marked(h, hhdr);
+#  if !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES)
+    if (GC_young_mark_active && GC_young_dense_retrace && GC_young_old_sources
+        && !GC_young_source_filter_disabled
+        && !IS_UNCOLLECTABLE(hhdr->hb_obj_kind))
+      GC_push_marked_word_bits(h, hhdr, TRUE, NULL);
+    else if (GC_young_sparse_active) {
+      const word *saved = GC_sparse_old_marks(h, hhdr);
+      if (saved != NULL) {
+        ++GC_young_old_source_blocks;
+        ++GC_young_old_source_empty;
+      } else if (!GC_push_dirty_large_length(h, hhdr))
+        GC_push_marked(h, hhdr);
+    } else
+#  endif
+    if (!GC_push_dirty_large_length(h, hhdr))
+      GC_push_marked(h, hhdr);
   }
+  GC_sparse_current_source = NULL;
   return h + OBJ_SZ_TO_BLOCKS(hhdr->hb_sz);
 }
 #endif /* !GC_DISABLE_INCREMENTAL */
@@ -2486,3 +4034,4 @@ GC_push_next_marked_uncollectable(struct hblk *h)
   }
   return h + OBJ_SZ_TO_BLOCKS(hhdr->hb_sz);
 }
+

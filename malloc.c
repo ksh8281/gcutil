@@ -18,6 +18,25 @@
 
 #include <string.h>
 
+STATIC MAY_THREAD_LOCAL GC_bool GC_large_defer_started;
+STATIC MAY_THREAD_LOCAL word GC_large_defer_epoch;
+STATIC MAY_THREAD_LOCAL word GC_large_defer_origin;
+STATIC MAY_THREAD_LOCAL word GC_large_defer_allowance;
+GC_INNER MAY_THREAD_LOCAL word GC_large_defer_epochs;
+GC_INNER MAY_THREAD_LOCAL word GC_large_defer_attempts;
+GC_INNER MAY_THREAD_LOCAL word GC_large_defer_success;
+GC_INNER MAY_THREAD_LOCAL word GC_large_defer_bytes;
+GC_INNER MAY_THREAD_LOCAL word GC_large_defer_limit_hits;
+
+GC_INNER void
+GC_large_defer_deinit(void)
+{
+  GC_large_defer_started = FALSE;
+  GC_large_defer_epoch = GC_large_defer_origin = GC_large_defer_allowance = 0;
+  GC_large_defer_epochs = GC_large_defer_attempts = GC_large_defer_success = 0;
+  GC_large_defer_bytes = GC_large_defer_limit_hits = 0;
+}
+
 /* Allocate reclaim list for the kind.  Returns `TRUE` on success. */
 STATIC GC_bool
 GC_alloc_reclaim_list(struct obj_kind *ok)
@@ -69,11 +88,41 @@ GC_alloc_large(size_t lb_adjusted, int kind, unsigned flags, size_t align_m1)
   n_blocks = OBJ_SZ_TO_BLOCKS_CHECKED(SIZET_SAT_ADD(lb_adjusted, align_m1));
 
   /* Do our share of marking work. */
-  if (GC_incremental && !GC_dont_gc) {
-    GC_collect_a_little_inner(n_blocks);
+  h = NULL;
+  if (GC_incremental_collection && !GC_dont_gc) {
+    if (GC_generational && GC_young_large_defer
+        && GC_time_limit == GC_TIME_UNLIMITED
+        && !GC_collection_in_progress() && !GC_young_mark_active
+        && !GC_is_full_gc && !GC_young_mark_clear_invalidated
+#ifndef GC_DISABLE_INCREMENTAL
+        && !GC_should_start_incremental_collection
+#endif
+        ) {
+      /* A completed stopped collection has no incremental mark work to
+         advance for this allocation. Reuse an already mapped free block
+         first; ordinary block-pressure handling still collects before
+         heap growth. This probe cannot remap or expand the heap. */
+      if (GC_admission_vdb_parked) {
+        /* Parked intervals collect only fulls. Match ordinary allocation
+           pressure instead of inserting an early incremental GC probe. */
+        h = GC_allochblk(lb_adjusted, kind, flags, align_m1);
+      } else {
+        ++GC_large_defer_attempts;
+        h = GC_try_mapped_allochblk(lb_adjusted, kind, flags, align_m1);
+        if (h != NULL) {
+          ++GC_large_defer_success;
+          GC_large_defer_bytes += lb_adjusted;
+        }
+      }
+    }
+    /* A successful try already installed an uninitialized object header.
+       Finish this allocation before any collection can inspect its body. */
+    if (h == NULL)
+      GC_collect_a_little_inner(n_blocks);
   }
 
-  h = GC_allochblk(lb_adjusted, kind, flags, align_m1);
+  if (h == NULL)
+    h = GC_allochblk(lb_adjusted, kind, flags, align_m1);
 #ifdef USE_MUNMAP
   if (NULL == h && GC_merge_unmapped()) {
     h = GC_allochblk(lb_adjusted, kind, flags, align_m1);
@@ -777,6 +826,8 @@ GC_free_internal(void *base, const hdr *hhdr, size_t clear_ofs,
 #ifdef LOG_ALLOCS
   GC_log_printf("Free %p after GC #%lu\n", base, (unsigned long)GC_gc_no);
 #endif
+  if (GC_young_mark_active && GC_young_sparse_sources && !IS_PTRFREE(hhdr))
+    GC_note_sparse_source_mutation();
   GC_bytes_freed += lb;
   if (IS_UNCOLLECTABLE(kind))
     GC_non_gc_bytes -= lb;

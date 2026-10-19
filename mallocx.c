@@ -101,6 +101,8 @@ GC_realloc(void *p, size_t lb)
     return NULL;
   }
   hhdr = HDR(HBLKPTR(p));
+  if (GC_young_mark_active && GC_young_sparse_sources && !IS_PTRFREE(hhdr))
+    GC_note_sparse_source_mutation();
   sz = hhdr->hb_sz;
   obj_kind = hhdr->hb_obj_kind;
   orig_sz = sz;
@@ -221,6 +223,8 @@ GC_realloc_no_shrink(void *p, size_t lb)
     return NULL;
   }
   hhdr = HDR(HBLKPTR(p));
+  if (GC_young_mark_active && GC_young_sparse_sources && !IS_PTRFREE(hhdr))
+    GC_note_sparse_source_mutation();
   sz = hhdr->hb_sz;
   obj_kind = hhdr->hb_obj_kind;
   orig_sz = sz;
@@ -466,18 +470,18 @@ GC_generic_malloc_many(size_t lb_adjusted, int kind, void **result)
 
   LOCK();
   /* Do our share of marking work. */
-  if (GC_incremental && !GC_dont_gc) {
+  if (GC_incremental_collection && !GC_dont_gc) {
     GC_collect_a_little_inner(1);
   }
 
   /* First see if we can reclaim a page of objects waiting to be reclaimed. */
   ok = &GC_obj_kinds[kind];
   rlh = ok->ok_reclaim_list;
-  if (rlh != NULL) {
+  if (rlh != NULL && !GC_young_mark_clear_invalidated) {
     struct hblk *hbp;
     hdr *hhdr;
 
-    while ((hbp = rlh[lg]) != NULL) {
+    while (!GC_young_mark_clear_invalidated && (hbp = rlh[lg]) != NULL) {
       hhdr = HDR(hbp);
       rlh[lg] = hhdr->hb_next;
       GC_ASSERT(hhdr->hb_sz == lb_adjusted);

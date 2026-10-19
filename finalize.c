@@ -128,7 +128,7 @@ GC_grow_table(struct hash_chain_entry ***table_ptr, unsigned *log_size_ptr,
    * the table grow.  Its capacity may grow before cleanup, but the metadata
    * allocations still count towards the ordinary collection budget.
    */
-  if (log_old_size >= (unsigned)GC_ON_GROW_LOG_SIZE_MIN && !GC_incremental
+  if (log_old_size >= (unsigned)GC_ON_GROW_LOG_SIZE_MIN && !GC_incremental_collection
       && !GC_dont_gc && GC_should_collect()) {
     IF_CANCEL(int cancel_state;)
 
@@ -155,7 +155,13 @@ GC_grow_table(struct hash_chain_entry ***table_ptr, unsigned *log_size_ptr,
       struct hash_chain_entry *next = p->next;
       size_t new_hash = HASH3(real_key, new_size, log_new_size);
 
-      p->next = new_table[new_hash];
+      /* `next` was already read for iteration.  Rehashing often preserves
+       * the link (especially NULL); rewriting it can still fault and dirty
+       * a protected GC page.  Keep the manual write barrier below even
+       * when no store is needed.
+       */
+      if (next != new_table[new_hash])
+        p->next = new_table[new_hash];
       GC_dirty(p);
       new_table[new_hash] = p;
       p = next;
@@ -1153,7 +1159,9 @@ GC_make_disappearing_links_disappear(struct dl_hashtbl_s *dl_hashtbl,
         dl_set_next(prev_dl, next_dl);
         GC_dirty(prev_dl);
       }
-      GC_clear_mark_bit(curr_dl);
+      /* The entry is no longer owned or exposed.  Its deliberately dead
+         mark must not invalidate a generational cohort of live objects. */
+      GC_clear_unlinked_mark_bit(curr_dl);
       dl_hashtbl->entries--;
     }
   }

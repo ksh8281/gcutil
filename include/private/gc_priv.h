@@ -2062,6 +2062,7 @@ struct _GC_arrays {
 
 #ifdef GC_DISABLE_INCREMENTAL
 #  define GC_incremental FALSE
+#  define GC_incremental_start_pending FALSE
 #else
   /*
    * Using incremental/generational collection.  Assumes dirty bits are
@@ -2069,6 +2070,12 @@ struct _GC_arrays {
    */
 #  define GC_incremental GC_arrays._incremental
   GC_bool _incremental;
+
+  /* Preserve VDB initialization and section registration while collecting
+     small heaps without page protection.  Activation is one-way and only
+     follows a completed full mark. */
+#  define GC_incremental_start_pending GC_arrays._incremental_start_pending
+  GC_bool _incremental_start_pending;
 
 #  define GC_should_start_incremental_collection \
     GC_arrays._should_start_incremental_collection
@@ -2653,6 +2660,11 @@ struct _GC_arrays {
 #define GC_valid_offsets GC_arrays._valid_offsets
   char _valid_offsets[VALID_OFFSET_SZ];
 
+  /* Optional coarse old cohort; libc bitmap storage is allocated lazily.
+     Keep its pointer in the collector's excluded root storage. */
+#define GC_young_old_block_map GC_arrays._young_old_block_map
+  word *_young_old_block_map;
+
 #ifndef GC_DISABLE_INCREMENTAL
   /* Pages that were dirty at last `GC_read_dirty()` call. */
 #  define GC_grungy_pages GC_arrays._grungy_pages
@@ -2753,6 +2765,18 @@ struct _GC_arrays {
 #define GC_is_enumerate_reachable_objects \
   GC_arrays._is_enumerate_reachable_objects
   GC_bool _is_enumerate_reachable_objects;
+  /* Keep hot marker controls with the existing per-heap state.  Android
+     builds resolve this state through the already cached GC_arrays base;
+     separate __thread objects would require emutls calls for each probe.
+     These fields remain per-heap and zero-initialized, as before. */
+  const word **_target_mark_table;
+  GC_bool _target_header_reuse;
+  GC_bool _young_mark_active;
+  GC_bool _young_mark_aborted;
+  GC_bool _young_sparse_sources;
+  GC_bool _young_sparse_active;
+  GC_bool _young_mark_clear_invalidated;
+  GC_bool _young_source_recovery_pending;
 };
 
 #if defined(ENABLE_TLS_ACCESS_BY_ADDRESS)
@@ -3008,6 +3032,39 @@ GC_INNER word GC_adj_bytes_allocd(void);
 
 /* Have we allocated enough to amortize a collection? */
 GC_INNER GC_bool GC_should_collect(void);
+GC_INNER GC_bool GC_should_collect_for_alloc(void);
+GC_INNER word GC_large_defer_budget(void);
+GC_INNER void GC_large_defer_deinit(void);
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_large_defer;
+GC_EXTERN MAY_THREAD_LOCAL word GC_large_defer_epochs;
+GC_EXTERN MAY_THREAD_LOCAL word GC_large_defer_attempts;
+GC_EXTERN MAY_THREAD_LOCAL word GC_large_defer_success;
+GC_EXTERN MAY_THREAD_LOCAL word GC_large_defer_bytes;
+GC_EXTERN MAY_THREAD_LOCAL word GC_large_defer_limit_hits;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_admission;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_park_vdb;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_admission_backoff;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_quiet_vdb_hints;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_full_rw_park;
+GC_EXTERN MAY_THREAD_LOCAL unsigned GC_admission_failed_probes;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_admission_vdb_parked;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_admission_skip_protect;
+GC_INNER void GC_admission_deinit(void);
+GC_INNER GC_bool GC_minor_grace_is_applicable(void);
+GC_INNER void GC_admission_forget_repair(void);
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_poor_samples;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_closings;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_rearms;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_suppressed;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_closed_fulls;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_parks;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_restore_fulls;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_untracked_fulls;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_backoff_max;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_backoff_resets;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_quiet_hints;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_full_rw_epochs;
+GC_EXTERN MAY_THREAD_LOCAL word GC_admission_full_rw_hints;
 
 /* Have we allocated enough to collect before carving out a new heap block? */
 GC_INNER GC_bool GC_should_collect_before_hblk_alloc(void);
@@ -3545,6 +3602,8 @@ GC_INNER ptr_t GC_build_fl(struct hblk *h, ptr_t list, size_t lg,
  */
 GC_INNER struct hblk *GC_allochblk(size_t lb_adjusted, int kind,
                                    unsigned flags, size_t align_m1);
+GC_INNER struct hblk *GC_try_mapped_allochblk(size_t lb_adjusted, int kind,
+                                             unsigned flags, size_t align_m1);
 
 /*
  * Deallocate (free) a heap block and mark it as invalid.  Coalesce it
@@ -3962,6 +4021,126 @@ GC_INNER void GC_stackbase_info_update_after_fork(void);
 #  endif
 #endif /* CAN_HANDLE_FORK */
 
+/* Dirty tracking can remain enabled for synchronous full collections.
+   Only collection scheduling should consult this predicate. */
+#define GC_incremental_collection \
+  (GC_incremental \
+   && (GC_full_freq != 0 || GC_time_limit != GC_TIME_UNLIMITED))
+GC_EXTERN MAY_THREAD_LOCAL word GC_incremental_start_threshold;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_generational;
+/* Mode setup/reset can run before GC_init establishes the fast TLS base. */
+#if defined(ENABLE_TLS_ACCESS_BY_ADDRESS) \
+    || defined(ENABLE_TLS_ACCESS_BY_PTHREAD_KEY)
+# define GC_marker_cold_arrays GC_arrays_instance
+#else
+# define GC_marker_cold_arrays GC_arrays
+#endif
+#define GC_target_mark_table GC_arrays._target_mark_table
+#define GC_target_header_reuse GC_arrays._target_header_reuse
+#define GC_young_mark_active GC_arrays._young_mark_active
+#define GC_young_mark_aborted GC_arrays._young_mark_aborted
+#define GC_young_sparse_sources GC_arrays._young_sparse_sources
+#define GC_young_sparse_active GC_arrays._young_sparse_active
+#define GC_young_mark_clear_invalidated GC_arrays._young_mark_clear_invalidated
+#define GC_young_source_recovery_pending GC_arrays._young_source_recovery_pending
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_rescuer_marking;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_root_marking;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_roots_first;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_retrace;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_block_retrace;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_dense_retrace;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_log_retrace;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_log_recording;
+GC_INNER void GC_begin_young_log(GC_bool can_repeat);
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_log_limit;
+GC_INNER void GC_record_young_log_mark(const void *base);
+GC_INNER void GC_finish_young_log(void);
+GC_INNER void GC_target_mark_table_begin(void);
+GC_INNER void GC_target_mark_table_end(void);
+#if defined(LINUX) && defined(ESCARGOT_USE_32BIT_IN_64BIT) \
+    && CPP_LOG_HBLKSIZE == 12 && !defined(MARK_BIT_PER_OBJ) && !defined(USE_MARK_BYTES) \
+    && !defined(PARALLEL_MARK)
+# define GC_HAS_TARGET_MARK_TABLE
+#endif
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_old_sources;
+#ifdef GC_TEST_ZERO_SOURCE_MUTATION
+GC_EXTERN MAY_THREAD_LOCAL word GC_test_zero_hidden_block;
+GC_EXTERN MAY_THREAD_LOCAL word GC_test_zero_hidden_child;
+GC_EXTERN MAY_THREAD_LOCAL word GC_test_zero_hidden_field;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_test_zero_skipped;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_test_zero_child_from_field;
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_test_zero_suppress_mutation;
+#endif
+GC_INNER void GC_sparse_record_new_mark(const hdr *hhdr, const void *base);
+GC_INNER void GC_sparse_sources_deinit(void);
+GC_INNER void GC_note_sparse_source_mutation(void);
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_marked_bits;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_bit_source_blocks;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_old_source_blocks;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_old_source_empty;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_old_source_recoveries;
+GC_INNER GC_bool GC_young_block_is_old(const hdr *hhdr);
+GC_INNER void GC_clear_unlinked_mark_bit(const void *p);
+GC_INNER GC_bool GC_prepare_young_retrace(void);
+GC_INNER GC_bool GC_young_pending_reclaim_safe(const hdr *hhdr);
+GC_INNER GC_bool GC_reclaim_before_young(void);
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_pending_kept;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_pending_drained;
+GC_INNER void GC_defer_young_baseline(void);
+GC_INNER GC_bool GC_young_pending_cost_exceeds_live(void);
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_baseline_captures;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_preflight_rejections;
+GC_INNER void GC_young_retrace_deinit(void);
+GC_INNER void GC_reset_young_remembered(GC_bool keep_current_dirty);
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_retrace_restores;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_retrace_rejections;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_retained_bytes;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_snapshot_bytes;
+
+GC_EXTERN MAY_THREAD_LOCAL unsigned GC_young_dirty_percent;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_live_bytes;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_live_limit;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_mark_attempts;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_mark_aborts;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_abort_rescuers;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_abort_roots;
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_dirty_rejections;
+
+
+/* Estimate newly reachable storage without touching allocation fast paths.
+   Sticky marks on explicitly freed/reused cells make this an approximation
+   of new survival, not an exact allocation age census.  Only a stopped
+   serial minor mark enables this accounting. */
+GC_INLINE GC_bool
+GC_charge_young_mark(const hdr *hhdr, const void *base)
+{
+  if (!GC_young_mark_aborted && !IS_UNCOLLECTABLE(hhdr->hb_obj_kind)) {
+    GC_young_live_bytes = GC_young_live_bytes > GC_WORD_MAX - hhdr->hb_sz
+                              ? GC_WORD_MAX
+                              : GC_young_live_bytes + hhdr->hb_sz;
+    if (GC_young_sparse_active && GC_young_rescuer_marking
+        && hhdr->hb_n_marks == 1 && !IS_PTRFREE(hhdr))
+      GC_sparse_record_new_mark(hhdr, base);
+    if (GC_young_log_recording)
+      GC_record_young_log_mark(base);
+    if (GC_young_live_bytes > GC_young_live_limit) {
+      GC_young_mark_aborted = TRUE;
+      if (GC_young_rescuer_marking)
+        ++GC_young_abort_rescuers;
+      if (GC_young_root_marking)
+        ++GC_young_abort_roots;
+    }
+  }
+  return GC_young_mark_aborted;
+}
+
+GC_INNER GC_bool GC_is_young_reclaim_candidate(const hdr *hhdr);
+GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_young_reclaim_active;
+GC_INNER GC_bool GC_prepare_young_reclaim(void);
+GC_EXTERN MAY_THREAD_LOCAL word GC_young_sweeps;
+GC_EXTERN MAY_THREAD_LOCAL word GC_old_blocks_preserved;
+
+
 #ifdef NO_MANUAL_VDB
 #  define GC_manual_vdb FALSE
 #  define GC_auto_incremental GC_incremental
@@ -3992,6 +4171,21 @@ GC_API_PATCHABLE void GC_dirty_inner(const void *p);
  * if the client calls `GC_enable_incremental()` once more).
  */
 GC_INNER GC_bool GC_dirty_init(void);
+
+#if defined(LINUX) && defined(GC_THREAD_ISOLATE) && defined(MPROTECT_VDB)
+GC_INNER void GC_coarse_protection_deinit(void);
+GC_INNER void GC_coarse_note_eligibility(ptr_t start, size_t bytes,
+                                         GC_bool eligible);
+GC_INNER void GC_coarse_invalidate_eligibility(void);
+GC_INNER void GC_coarse_note_rw_remap(ptr_t start, size_t bytes);
+GC_INNER void GC_coarse_note_foreign_write(ptr_t start, size_t bytes);
+/* Return FALSE if the exact eligibility index is unavailable.  Otherwise
+   return the next pointer-bearing dirty allocation block, or NULL at end. */
+GC_INNER GC_bool GC_next_dirty_candidate(struct hblk *start,
+                                         struct hblk **result);
+GC_INNER GC_bool GC_next_pending_candidate(struct hblk *start,
+                                           struct hblk **result);
+#endif
 
 #  ifdef UFFDWP_VDB
 /*
@@ -4039,6 +4233,9 @@ GC_INNER GC_bool GC_page_was_dirty(const struct hblk *h);
  *   - may be essential if we need to ensure that pointer-free system
  *     call buffers in the heap are not protected.
  */
+GC_INNER GC_bool GC_kind_is_manual(unsigned kind);
+GC_INNER void GC_coarse_note_manual(ptr_t start, size_t bytes, GC_bool manual);
+
 GC_INNER void GC_remove_protection(struct hblk *h, size_t nblocks,
                                    GC_bool is_ptrfree);
 
