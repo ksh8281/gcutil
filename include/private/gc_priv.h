@@ -3067,7 +3067,7 @@ GC_EXTERN MAY_THREAD_LOCAL word GC_admission_full_rw_epochs;
 GC_EXTERN MAY_THREAD_LOCAL word GC_admission_full_rw_hints;
 
 /* Have we allocated enough to collect before carving out a new heap block? */
-GC_INNER GC_bool GC_should_collect_before_hblk_alloc(void);
+GC_INNER GC_bool GC_should_collect_before_hblk_alloc(size_t request);
 
 /*
  * Get the next block whose address is at least `h`.  Returned block

@@ -683,8 +683,28 @@ GC_get_allochblk_collect_divisor(void)
  * about to be carved out has a fair chance of coming from reclaimed space
  * instead of from a heap expansion.
  */
+STATIC MAY_THREAD_LOCAL word GC_young_growth_debt;
+STATIC MAY_THREAD_LOCAL int GC_young_growth_cap_kib = -1;
+
+STATIC word
+GC_young_growth_budget(void)
+{
+  word budget, cap;
+  if (!GC_generational || GC_time_limit != GC_TIME_UNLIMITED
+      || GC_admission_vdb_parked)
+    return 0;
+  if (GC_young_growth_cap_kib < 0) {
+    const char *setting = GETENV("GC_BENCH_YOUNG_GROWTH_KIB");
+    int value = setting != NULL ? atoi(setting) : 0;
+    GC_young_growth_cap_kib = value > 0 && value <= 1024 ? value : 0;
+  }
+  cap = (word)GC_young_growth_cap_kib * 1024;
+  budget = min_bytes_allocd_for_allocation() / 4;
+  return budget < cap ? budget : cap;
+}
+
 GC_INNER GC_bool
-GC_should_collect_before_hblk_alloc(void)
+GC_should_collect_before_hblk_alloc(size_t request)
 {
   word budget = MIN_BYTES_SINCE_GC_BEFORE_COLLECT;
 
@@ -695,12 +715,16 @@ GC_should_collect_before_hblk_alloc(void)
   if (UNLIKELY(GC_young_mark_clear_invalidated))
     return TRUE;
 
-  /* A partial collection may retain dead old objects. If its reclaimed
-     blocks cannot satisfy this request, try a full mark before growing
-     the heap. The partial just reset the allocation counter, so the
-     ordinary amortization budget alone would incorrectly permit growth. */
-  if (GC_generational && GC_n_partial_gcs != 0)
-    return TRUE;
+  /* A minor may reclaim cells in other size classes without satisfying
+     this block request. A small, opt-in allowance can avoid an immediate
+     full in that case. Charge actual heap growth across the entire interval
+     between fulls; the reset allocation counter alone cannot bound it.
+     A zero allowance retains the immediate full before growth. */
+  if (GC_generational && GC_n_partial_gcs != 0) {
+    word budget = GC_young_growth_budget();
+    return GC_need_full_gc || request > budget
+           || GC_young_growth_debt > budget - request;
+  }
 
   if (GC_allochblk_collect_divisor != 0) {
     word scaled = GC_heapsize / GC_allochblk_collect_divisor;
@@ -790,9 +814,9 @@ GC_INNER MAY_THREAD_LOCAL word GC_admission_quiet_hints;
 GC_INNER MAY_THREAD_LOCAL word GC_admission_full_rw_epochs;
 GC_INNER MAY_THREAD_LOCAL word GC_admission_full_rw_hints;
 
-/* Compare completed collector work on this heap, independent of CPU speed.
-   Two costly automatic minors request a full, then reuse the existing admission
-   parking/rearm path. The margin reserves room for mutator-side VDB costs. */
+/* Price the minor work against allocation progress between full collections.
+   Recheck unproductive intervals even when their total live size is stable;
+   an unchanged live-size total can hide a different allocation pattern. */
 STATIC MAY_THREAD_LOCAL GC_bool GC_admission_cost_pending;
 STATIC MAY_THREAD_LOCAL unsigned GC_admission_cost_poor_streak;
 STATIC MAY_THREAD_LOCAL unsigned GC_admission_probe_fulls;
@@ -802,7 +826,6 @@ STATIC MAY_THREAD_LOCAL word GC_admission_epoch_origin;
 #ifndef NO_CLOCK
 STATIC MAY_THREAD_LOCAL CLOCK_TYPE GC_admission_cost_start_time;
 STATIC MAY_THREAD_LOCAL GC_bool GC_admission_cost_running;
-STATIC MAY_THREAD_LOCAL double GC_admission_last_full_cost_ms;
 STATIC MAY_THREAD_LOCAL double GC_admission_epoch_minor_cost_ms;
 #endif
 
@@ -816,7 +839,6 @@ GC_admission_reset_cost(void)
   GC_admission_epoch_input = GC_admission_epoch_origin = 0;
 #ifndef NO_CLOCK
   GC_admission_cost_running = FALSE;
-  GC_admission_last_full_cost_ms = 0;
   GC_admission_epoch_minor_cost_ms = 0;
 #endif
 }
@@ -871,7 +893,6 @@ GC_admission_cost_finish(GC_bool is_full)
     }
     GC_admission_epoch_input = 0;
     GC_admission_epoch_minor_cost_ms = 0;
-    GC_admission_last_full_cost_ms = cost_ms;
   } else if (GC_admission_sample && GC_admission_input != 0) {
     if (GC_admission_epoch_input == 0) {
       GC_admission_epoch_input = GC_admission_input;
@@ -900,6 +921,8 @@ GC_minor_grace_is_applicable(void)
 GC_INNER void
 GC_admission_deinit(void)
 {
+  GC_young_growth_debt = 0;
+  GC_young_growth_cap_kib = -1;
   GC_admission_reset_cost();
   GC_admission_closed = GC_admission_sample = GC_admission_pending = FALSE;
   GC_admission_ignore_full = FALSE;
@@ -975,9 +998,8 @@ GC_admission_finish(GC_bool is_full)
         ++GC_admission_rearms;
       }
     }
-    /* A minor retaining at least ninety percent of its input must buy
-       another allocation window before the next full to justify the work.
-       Small progress alone does not show that a full was avoided. */
+    /* Without a cost timer, retain the high-survival progress fallback.
+       With a timer, the completed full prices all preceding minor work. */
     if (!GC_admission_closed
         && (GC_admission_cost_pending
 #ifdef NO_CLOCK
@@ -2100,8 +2122,10 @@ GC_finish_collection(void)
     GC_bench_anchor_gc_no = GC_gc_no;
     if (GC_generational && GC_bench_anchor_enabled())
       ++GC_bench_anchor_full_updates;
-    if (GC_generational)
+    if (GC_generational) {
       GC_n_partial_gcs = 0;
+      GC_young_growth_debt = 0;
+    }
     GC_used_heap_size_after_full = GC_heapsize - GC_large_free_bytes;
     GC_need_full_gc = FALSE;
   } else {
@@ -2558,6 +2582,8 @@ GC_expand_hp_inner(word n)
   }
   GC_last_heap_addr = ADDR(space);
 
+  if (GC_generational && GC_n_partial_gcs != 0)
+    GC_young_growth_debt = SIZET_SAT_ADD(GC_young_growth_debt, sz);
   GC_add_to_heap(space, sz);
   if (GC_on_heap_resize)
     (*GC_on_heap_resize)(GC_heapsize);
@@ -2697,6 +2723,15 @@ GC_collect_or_expand(word needed_blocks, unsigned flags, GC_bool retry)
       blocks_to_get = divHBLKSZ(GC_WORD_MAX);
   } else if (blocks_to_get < MINHINCR) {
     blocks_to_get = MINHINCR;
+  }
+
+  if (GC_generational && GC_n_partial_gcs != 0) {
+    word budget = GC_young_growth_budget();
+    if (budget > GC_young_growth_debt) {
+      word remaining_blocks = divHBLKSZ(budget - GC_young_growth_debt);
+      if (needed_blocks <= remaining_blocks && blocks_to_get > remaining_blocks)
+        blocks_to_get = remaining_blocks;
+    }
   }
 
   if (GC_max_heapsize > GC_heapsize) {
