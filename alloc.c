@@ -827,6 +827,7 @@ STATIC MAY_THREAD_LOCAL word GC_admission_epoch_origin;
 STATIC MAY_THREAD_LOCAL CLOCK_TYPE GC_admission_cost_start_time;
 STATIC MAY_THREAD_LOCAL GC_bool GC_admission_cost_running;
 STATIC MAY_THREAD_LOCAL double GC_admission_epoch_minor_cost_ms;
+STATIC MAY_THREAD_LOCAL double GC_admission_previous_full_cost_ms;
 #endif
 
 STATIC void
@@ -840,6 +841,7 @@ GC_admission_reset_cost(void)
 #ifndef NO_CLOCK
   GC_admission_cost_running = FALSE;
   GC_admission_epoch_minor_cost_ms = 0;
+  GC_admission_previous_full_cost_ms = 0;
 #endif
 }
 
@@ -878,7 +880,14 @@ GC_admission_cost_finish(GC_bool is_full)
          a full: it must buy allocation before the full is needed again.
          Compare the whole minor epoch with that delayed allocation window.
          Reserve a quarter of the collector saving for tracking overhead. */
-      double saved_full_cost = cost_ms * (double)progress
+      /* A growing graph makes the later full more expensive. Do not
+         credit an earlier minor for full work added after that minor.
+         The cheaper adjacent full bounds the value of its extra window. */
+      double full_price = cost_ms;
+      if (GC_admission_previous_full_cost_ms > 0
+          && GC_admission_previous_full_cost_ms < full_price)
+        full_price = GC_admission_previous_full_cost_ms;
+      double saved_full_cost = full_price * (double)progress
                                / (double)GC_admission_epoch_input;
       if (GC_admission_epoch_minor_cost_ms * 1.25 >= saved_full_cost) {
         if (GC_admission_cost_poor_streak < 2)
@@ -893,6 +902,7 @@ GC_admission_cost_finish(GC_bool is_full)
     }
     GC_admission_epoch_input = 0;
     GC_admission_epoch_minor_cost_ms = 0;
+    GC_admission_previous_full_cost_ms = cost_ms;
   } else if (GC_admission_sample && GC_admission_input != 0) {
     if (GC_admission_epoch_input == 0) {
       GC_admission_epoch_input = GC_admission_input;
