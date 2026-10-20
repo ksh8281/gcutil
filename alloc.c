@@ -795,11 +795,15 @@ GC_INNER MAY_THREAD_LOCAL word GC_admission_full_rw_hints;
    parking/rearm path. The margin reserves room for mutator-side VDB costs. */
 STATIC MAY_THREAD_LOCAL GC_bool GC_admission_cost_pending;
 STATIC MAY_THREAD_LOCAL unsigned GC_admission_cost_poor_streak;
+STATIC MAY_THREAD_LOCAL unsigned GC_admission_probe_fulls;
+STATIC MAY_THREAD_LOCAL GC_bool GC_admission_economic_productive;
+STATIC MAY_THREAD_LOCAL word GC_admission_epoch_input;
+STATIC MAY_THREAD_LOCAL word GC_admission_epoch_origin;
 #ifndef NO_CLOCK
 STATIC MAY_THREAD_LOCAL CLOCK_TYPE GC_admission_cost_start_time;
 STATIC MAY_THREAD_LOCAL GC_bool GC_admission_cost_running;
 STATIC MAY_THREAD_LOCAL double GC_admission_last_full_cost_ms;
-STATIC MAY_THREAD_LOCAL double GC_admission_bad_minor_cost_ms;
+STATIC MAY_THREAD_LOCAL double GC_admission_epoch_minor_cost_ms;
 #endif
 
 STATIC void
@@ -807,10 +811,13 @@ GC_admission_reset_cost(void)
 {
   GC_admission_cost_pending = FALSE;
   GC_admission_cost_poor_streak = 0;
+  GC_admission_probe_fulls = 0;
+  GC_admission_economic_productive = FALSE;
+  GC_admission_epoch_input = GC_admission_epoch_origin = 0;
 #ifndef NO_CLOCK
   GC_admission_cost_running = FALSE;
   GC_admission_last_full_cost_ms = 0;
-  GC_admission_bad_minor_cost_ms = 0;
+  GC_admission_epoch_minor_cost_ms = 0;
 #endif
 }
 
@@ -841,28 +848,36 @@ GC_admission_cost_finish(GC_bool is_full)
   cost_ms = (double)MS_TIME_DIFF(now, GC_admission_cost_start_time)
             + (double)NS_FRAC_TIME_DIFF(now, GC_admission_cost_start_time)
                 / 1000000.0;
+  GC_admission_economic_productive = FALSE;
   if (is_full) {
-    /* Recheck against this full as the live graph may have changed. */
-    if (GC_admission_cost_pending
-        && GC_admission_bad_minor_cost_ms * 3.0 < cost_ms) {
-      GC_admission_cost_pending = FALSE;
-      GC_admission_cost_poor_streak = 0;
+    if (GC_admission_epoch_input != 0) {
+      word progress = GC_admission_mark_total - GC_admission_epoch_origin;
+      /* A cheap minor need not cost less than an arbitrary fraction of
+         a full: it must buy allocation before the full is needed again.
+         Compare the whole minor epoch with that delayed allocation window.
+         Reserve a quarter of the collector saving for tracking overhead. */
+      double saved_full_cost = cost_ms * (double)progress
+                               / (double)GC_admission_epoch_input;
+      if (GC_admission_epoch_minor_cost_ms * 1.25 >= saved_full_cost) {
+        if (GC_admission_cost_poor_streak < 2)
+          ++GC_admission_cost_poor_streak;
+        GC_admission_cost_pending = GC_admission_cost_poor_streak >= 2;
+        ++GC_admission_poor_samples;
+      } else {
+        GC_admission_cost_poor_streak = 0;
+        GC_admission_cost_pending = FALSE;
+        GC_admission_economic_productive = TRUE;
+      }
     }
+    GC_admission_epoch_input = 0;
+    GC_admission_epoch_minor_cost_ms = 0;
     GC_admission_last_full_cost_ms = cost_ms;
-  } else if (GC_admission_sample && GC_admission_last_full_cost_ms > 0) {
-    if (cost_ms * 3.0 >= GC_admission_last_full_cost_ms) {
-      GC_admission_bad_minor_cost_ms
-          = GC_admission_cost_poor_streak == 0
-                ? cost_ms : (GC_admission_bad_minor_cost_ms + cost_ms) / 2.0;
-      if (GC_admission_cost_poor_streak < 2)
-        ++GC_admission_cost_poor_streak;
-      if (GC_admission_cost_poor_streak >= 2)
-        GC_admission_cost_pending = TRUE;
-      ++GC_admission_poor_samples;
-    } else {
-      GC_admission_cost_poor_streak = 0;
-      GC_admission_cost_pending = FALSE;
+  } else if (GC_admission_sample && GC_admission_input != 0) {
+    if (GC_admission_epoch_input == 0) {
+      GC_admission_epoch_input = GC_admission_input;
+      GC_admission_epoch_origin = GC_admission_mark_total;
     }
+    GC_admission_epoch_minor_cost_ms += cost_ms;
   }
 #else
   UNUSED_ARG(is_full);
@@ -952,7 +967,10 @@ GC_admission_finish(GC_bool is_full)
       word change = GC_admission_anchor / divisor
                       + (GC_admission_anchor % divisor != 0);
       ++GC_admission_closed_fulls;
-      if (delta >= (change != 0 ? change : 1)) {
+      if (GC_admission_probe_fulls != 0)
+        --GC_admission_probe_fulls;
+      if (delta >= (change != 0 ? change : 1)
+          || GC_admission_probe_fulls == 0) {
         GC_admission_closed = FALSE;
         ++GC_admission_rearms;
       }
@@ -962,9 +980,12 @@ GC_admission_finish(GC_bool is_full)
        Small progress alone does not show that a full was avoided. */
     if (!GC_admission_closed
         && (GC_admission_cost_pending
+#ifdef NO_CLOCK
             || (GC_admission_pending
                 && GC_admission_mark_total - GC_admission_origin
-                       <= GC_admission_pending_input))) {
+                       <= GC_admission_pending_input)
+#endif
+            )) {
       GC_admission_closed = TRUE;
       GC_admission_anchor = live;
       ++GC_admission_closings;
@@ -973,7 +994,17 @@ GC_admission_finish(GC_bool is_full)
         if (GC_admission_backoff_max < GC_admission_failed_probes)
           GC_admission_backoff_max = GC_admission_failed_probes;
       }
-    } else if (GC_admission_pending) {
+      /* A stable live-size total can hide a different allocation pattern.
+         Retry after a bounded number of fulls, preserving the tracked-full
+         barrier before another minor. */
+      GC_admission_probe_fulls = 1U << GC_admission_failed_probes;
+    } else if (
+#ifdef NO_CLOCK
+               GC_admission_pending
+#else
+               GC_admission_economic_productive
+#endif
+               ) {
       /* A high marked closure can still be useful when allocation makes
          progress before the next full.  Do not compound that history. */
       GC_admission_productive_probe();
@@ -997,9 +1028,11 @@ GC_admission_finish(GC_bool is_full)
     }
     ++GC_admission_poor_samples;
   } else {
+#ifdef NO_CLOCK
     if (GC_admission_sample && GC_admission_input != 0
         && GC_admission_cost_poor_streak == 0)
       GC_admission_productive_probe();
+#endif
     GC_admission_pending = FALSE;
   }
   GC_admission_sample = FALSE;
