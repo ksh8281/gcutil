@@ -1041,7 +1041,9 @@ GC_allochblk(size_t lb_adjusted, int kind,
   }
 #endif
 
-  if (GC_should_collect_before_hblk_alloc()) {
+  if (GC_should_collect_before_hblk_alloc(
+          OBJ_SZ_TO_BLOCKS_CHECKED(SIZET_SAT_ADD(lb_adjusted, align_m1))
+              * HBLKSIZE)) {
     if (GC_generational)
       GC_COND_LOG_PRINTF("Generational schedule: full before block growth\n");
     /*
