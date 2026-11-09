@@ -814,6 +814,58 @@ GC_INNER MAY_THREAD_LOCAL word GC_admission_quiet_hints;
 GC_INNER MAY_THREAD_LOCAL word GC_admission_full_rw_epochs;
 GC_INNER MAY_THREAD_LOCAL word GC_admission_full_rw_hints;
 
+/* Syntax hints carry no reachability or lifetime guarantee.  In this opt-in
+   experiment, 4096 hinted creations earn a trial; existing cost admission can
+   reject it.  Never mutate page tracking or sticky marks from a JS opcode. */
+STATIC MAY_THREAD_LOCAL unsigned GC_pattern_mode;
+STATIC MAY_THREAD_LOCAL word GC_pattern_hints[3];
+STATIC MAY_THREAD_LOCAL word GC_pattern_total;
+STATIC MAY_THREAD_LOCAL word GC_pattern_last_full;
+STATIC MAY_THREAD_LOCAL word GC_pattern_close_anchor;
+STATIC MAY_THREAD_LOCAL unsigned GC_pattern_quiet_fulls;
+STATIC MAY_THREAD_LOCAL word GC_pattern_activations;
+STATIC MAY_THREAD_LOCAL word GC_pattern_quiet_closings;
+
+GC_API void GC_CALL
+GC_configure_allocation_pattern(unsigned mode)
+{
+  GC_ASSERT(!GC_is_initialized && mode <= 2);
+  GC_pattern_mode = mode;
+  GC_pattern_hints[0] = GC_pattern_hints[1] = GC_pattern_hints[2] = 0;
+  GC_pattern_total = GC_pattern_last_full = GC_pattern_close_anchor = 0;
+  GC_pattern_quiet_fulls = 0;
+  GC_pattern_activations = GC_pattern_quiet_closings = 0;
+}
+
+GC_API unsigned GC_CALL
+GC_allocation_pattern_mode(void)
+{
+  return GC_pattern_mode;
+}
+
+GC_API void GC_CALL
+GC_note_allocation_pattern(unsigned kind)
+{
+  GC_ASSERT(kind < 3);
+  if (GC_pattern_mode == 2) {
+    ++GC_pattern_hints[kind];
+    ++GC_pattern_total;
+  }
+}
+
+GC_API void GC_CALL
+GC_allocation_pattern_stats(GC_word *stats)
+{
+  stats[0] = GC_pattern_mode;
+  stats[1] = GC_pattern_total;
+  stats[2] = GC_pattern_hints[0];
+  stats[3] = GC_pattern_hints[1];
+  stats[4] = GC_pattern_hints[2];
+  stats[5] = GC_pattern_activations;
+  stats[6] = GC_pattern_quiet_closings;
+  stats[7] = GC_pattern_quiet_fulls;
+}
+
 /* Price the minor work against allocation progress between full collections.
    Recheck unproductive intervals even when their total live size is stable;
    an unchanged live-size total can hide a different allocation pattern. */
@@ -931,6 +983,11 @@ GC_minor_grace_is_applicable(void)
 GC_INNER void
 GC_admission_deinit(void)
 {
+  GC_pattern_mode = 0;
+  GC_pattern_hints[0] = GC_pattern_hints[1] = GC_pattern_hints[2] = 0;
+  GC_pattern_total = GC_pattern_last_full = GC_pattern_close_anchor = 0;
+  GC_pattern_quiet_fulls = 0;
+  GC_pattern_activations = GC_pattern_quiet_closings = 0;
   GC_young_growth_debt = 0;
   GC_young_growth_cap_kib = -1;
   GC_admission_reset_cost();
@@ -990,7 +1047,17 @@ GC_admission_finish(GC_bool is_full)
   }
   if (is_full) {
     word live = GC_composite_in_use + GC_atomic_in_use;
+    GC_bool pattern_quiet = FALSE;
 
+    if (GC_pattern_mode == 2) {
+      word recent = GC_pattern_total - GC_pattern_last_full;
+      GC_pattern_last_full = GC_pattern_total;
+      if (recent != 0)
+        GC_pattern_quiet_fulls = 0;
+      else if (GC_pattern_activations != 0 && GC_pattern_quiet_fulls < 2)
+        ++GC_pattern_quiet_fulls;
+      pattern_quiet = GC_pattern_quiet_fulls >= 2;
+    }
     if (GC_admission_closed) {
       word delta = live > GC_admission_anchor
                        ? live - GC_admission_anchor
@@ -1002,8 +1069,11 @@ GC_admission_finish(GC_bool is_full)
       ++GC_admission_closed_fulls;
       if (GC_admission_probe_fulls != 0)
         --GC_admission_probe_fulls;
-      if (delta >= (change != 0 ? change : 1)
-          || GC_admission_probe_fulls == 0) {
+      if (GC_pattern_mode == 2
+              ? (GC_admission_probe_fulls == 0
+                 && GC_pattern_total - GC_pattern_close_anchor >= 4096)
+              : (delta >= (change != 0 ? change : 1)
+                 || GC_admission_probe_fulls == 0)) {
         GC_admission_closed = FALSE;
         ++GC_admission_rearms;
       }
@@ -1011,7 +1081,7 @@ GC_admission_finish(GC_bool is_full)
     /* Without a cost timer, retain the high-survival progress fallback.
        With a timer, the completed full prices all preceding minor work. */
     if (!GC_admission_closed
-        && (GC_admission_cost_pending
+        && (GC_admission_cost_pending || pattern_quiet
 #ifdef NO_CLOCK
             || (GC_admission_pending
                 && GC_admission_mark_total - GC_admission_origin
@@ -1020,6 +1090,9 @@ GC_admission_finish(GC_bool is_full)
             )) {
       GC_admission_closed = TRUE;
       GC_admission_anchor = live;
+      GC_pattern_close_anchor = GC_pattern_total;
+      if (pattern_quiet)
+        ++GC_pattern_quiet_closings;
       ++GC_admission_closings;
       if (GC_young_admission_backoff && GC_admission_failed_probes < 3) {
         ++GC_admission_failed_probes;
@@ -2155,7 +2228,8 @@ GC_finish_collection(void)
 
 #if !defined(GC_DISABLE_INCREMENTAL) && defined(MPROTECT_VDB)
   if (GC_incremental_start_pending
-      && GC_used_heap_size_after_full >= GC_incremental_start_threshold) {
+      && (GC_used_heap_size_after_full >= GC_incremental_start_threshold
+          || (GC_pattern_mode == 2 && GC_pattern_total >= 4096))) {
     /* All reachable objects were traced by this ordinary full collection.
        Start dirty tracking only after all live objects have been traced;
        the first protection pass covers every pointer-bearing heap range. */
@@ -2164,6 +2238,8 @@ GC_finish_collection(void)
     GC_handle_protected_regions_limit();
     if (GC_incremental) {
       GC_read_dirty(TRUE);
+      if (GC_incremental && GC_pattern_mode != 0)
+        ++GC_pattern_activations;
       if (GC_incremental)
         GC_COND_LOG_PRINTF("Incremental mprotect activated after full collection #%lu: occupied heap %lu bytes, threshold %lu bytes\n",
                            (unsigned long)GC_gc_no,
