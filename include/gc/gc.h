@@ -1359,12 +1359,16 @@ GC_API void GC_CALL GC_enable_dirty_tracking(size_t /* start_threshold */);
 GC_API void GC_CALL GC_enable_generational(size_t /* start_threshold */);
 
 /* Experimental isolated-heap policy. Configure after enable_generational and
- * before GC_init: 0=legacy, 1=early activation, 2=syntax-hinted admission.
+ * before GC_init: 0=legacy, 1=first-full activation, 2=4096 syntax hints,
+ * 3=64 syntax hints, 4=64 repeated hints from a filtered allocation site.
  * Hints neither allocate nor collect. Counters are consumed at full boundaries.
  * The caller must own the isolated heap; these functions are unsynchronized. */
 GC_API void GC_CALL GC_configure_allocation_pattern(unsigned /* mode */);
 GC_API unsigned GC_CALL GC_allocation_pattern_mode(void);
 GC_API void GC_CALL GC_note_allocation_pattern(unsigned /* kind: 0..2 */);
+GC_API GC_word GC_CALL GC_new_allocation_pattern_site(void);
+GC_API void GC_CALL GC_note_allocation_pattern_site(unsigned, GC_word);
+GC_API void GC_CALL GC_allocation_refined_stats(GC_word * /* eight entries */);
 GC_API void GC_CALL GC_allocation_pattern_stats(GC_word * /* eight entries */);
 
 /**

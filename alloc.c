@@ -825,11 +825,79 @@ STATIC MAY_THREAD_LOCAL word GC_pattern_close_anchor;
 STATIC MAY_THREAD_LOCAL unsigned GC_pattern_quiet_fulls;
 STATIC MAY_THREAD_LOCAL word GC_pattern_activations;
 STATIC MAY_THREAD_LOCAL word GC_pattern_quiet_closings;
+STATIC MAY_THREAD_LOCAL word GC_pattern_sites;
+STATIC MAY_THREAD_LOCAL word GC_pattern_evidence;
+STATIC MAY_THREAD_LOCAL word GC_pattern_evidence_anchor;
+STATIC MAY_THREAD_LOCAL word GC_pattern_hot_site;
+STATIC MAY_THREAD_LOCAL word GC_pattern_rejected_site;
+STATIC MAY_THREAD_LOCAL unsigned GC_pattern_failures;
+STATIC MAY_THREAD_LOCAL word GC_pattern_activation_gc;
+STATIC MAY_THREAD_LOCAL word GC_pattern_activation_hints;
+STATIC MAY_THREAD_LOCAL word GC_pattern_activation_evidence;
+STATIC MAY_THREAD_LOCAL word GC_pattern_activation_allocated;
+/* Direct-mapped TLS counters avoid writes to protected bytecode pages and
+   retain neither heap objects nor bytecode addresses. Collisions restart the
+   hotness count; they cannot grant another site's credit. */
+STATIC MAY_THREAD_LOCAL struct {
+  word site;
+  unsigned hits;
+} GC_pattern_site_counters[256];
+
+STATIC void
+GC_pattern_reset_sites(void)
+{
+  GC_pattern_sites = GC_pattern_evidence = GC_pattern_evidence_anchor = 0;
+  GC_pattern_hot_site = GC_pattern_rejected_site = 0;
+  GC_pattern_failures = 0;
+  GC_pattern_activation_gc = GC_pattern_activation_hints = 0;
+  GC_pattern_activation_evidence = GC_pattern_activation_allocated = 0;
+  BZERO(GC_pattern_site_counters, sizeof(GC_pattern_site_counters));
+}
+
+GC_API GC_word GC_CALL
+GC_new_allocation_pattern_site(void)
+{
+  return ++GC_pattern_sites;
+}
+
+GC_API void GC_CALL
+GC_note_allocation_pattern_site(unsigned kind, GC_word site)
+{
+  unsigned slot = (unsigned)(site % 256);
+  GC_ASSERT(kind < 3 && site != 0);
+  if (GC_pattern_mode != 4)
+    return;
+  ++GC_pattern_total;
+  ++GC_pattern_hints[kind];
+  if (GC_pattern_site_counters[slot].site != site) {
+    GC_pattern_site_counters[slot].site = site;
+    GC_pattern_site_counters[slot].hits = 0;
+  }
+  if (++GC_pattern_site_counters[slot].hits == 64) {
+    GC_pattern_site_counters[slot].hits = 0;
+    GC_pattern_evidence += 64;
+    GC_pattern_hot_site = site;
+  }
+}
+
+GC_API void GC_CALL
+GC_allocation_refined_stats(GC_word *stats)
+{
+  stats[0] = GC_pattern_sites;
+  stats[1] = GC_pattern_evidence;
+  stats[2] = GC_pattern_failures;
+  stats[3] = GC_pattern_activation_gc;
+  stats[4] = GC_pattern_activation_hints;
+  stats[5] = GC_pattern_activation_evidence;
+  stats[6] = GC_pattern_activation_allocated;
+  stats[7] = GC_pattern_rejected_site;
+}
 
 GC_API void GC_CALL
 GC_configure_allocation_pattern(unsigned mode)
 {
-  GC_ASSERT(!GC_is_initialized && mode <= 2);
+  GC_ASSERT(!GC_is_initialized && mode <= 4);
+  GC_pattern_reset_sites();
   GC_pattern_mode = mode;
   GC_pattern_hints[0] = GC_pattern_hints[1] = GC_pattern_hints[2] = 0;
   GC_pattern_total = GC_pattern_last_full = GC_pattern_close_anchor = 0;
@@ -847,7 +915,7 @@ GC_API void GC_CALL
 GC_note_allocation_pattern(unsigned kind)
 {
   GC_ASSERT(kind < 3);
-  if (GC_pattern_mode == 2) {
+  if (GC_pattern_mode == 2 || GC_pattern_mode == 3) {
     ++GC_pattern_hints[kind];
     ++GC_pattern_total;
   }
@@ -983,6 +1051,7 @@ GC_minor_grace_is_applicable(void)
 GC_INNER void
 GC_admission_deinit(void)
 {
+  GC_pattern_reset_sites();
   GC_pattern_mode = 0;
   GC_pattern_hints[0] = GC_pattern_hints[1] = GC_pattern_hints[2] = 0;
   GC_pattern_total = GC_pattern_last_full = GC_pattern_close_anchor = 0;
@@ -1049,7 +1118,7 @@ GC_admission_finish(GC_bool is_full)
     word live = GC_composite_in_use + GC_atomic_in_use;
     GC_bool pattern_quiet = FALSE;
 
-    if (GC_pattern_mode == 2) {
+    if (GC_pattern_mode >= 2) {
       word recent = GC_pattern_total - GC_pattern_last_full;
       GC_pattern_last_full = GC_pattern_total;
       if (recent != 0)
@@ -1069,11 +1138,21 @@ GC_admission_finish(GC_bool is_full)
       ++GC_admission_closed_fulls;
       if (GC_admission_probe_fulls != 0)
         --GC_admission_probe_fulls;
-      if (GC_pattern_mode == 2
-              ? (GC_admission_probe_fulls == 0
-                 && GC_pattern_total - GC_pattern_close_anchor >= 4096)
-              : (delta >= (change != 0 ? change : 1)
-                 || GC_admission_probe_fulls == 0)) {
+      GC_bool retry;
+      if (GC_pattern_mode == 4) {
+        word evidence = GC_pattern_evidence - GC_pattern_evidence_anchor;
+        word required = GC_pattern_rejected_site == 0 ? 64
+            : GC_pattern_hot_site != GC_pattern_rejected_site ? 256
+            : (word)4096 << GC_pattern_failures;
+        retry = GC_admission_probe_fulls == 0 && evidence >= required;
+      } else if (GC_pattern_mode >= 2) {
+        retry = GC_admission_probe_fulls == 0
+                && GC_pattern_total - GC_pattern_close_anchor >= 4096;
+      } else {
+        retry = delta >= (change != 0 ? change : 1)
+                || GC_admission_probe_fulls == 0;
+      }
+      if (retry) {
         GC_admission_closed = FALSE;
         ++GC_admission_rearms;
       }
@@ -1091,6 +1170,12 @@ GC_admission_finish(GC_bool is_full)
       GC_admission_closed = TRUE;
       GC_admission_anchor = live;
       GC_pattern_close_anchor = GC_pattern_total;
+      if (GC_pattern_mode == 4) {
+        GC_pattern_evidence_anchor = GC_pattern_evidence;
+        GC_pattern_rejected_site = pattern_quiet ? 0 : GC_pattern_hot_site;
+        if (!pattern_quiet && GC_pattern_failures < 6)
+          ++GC_pattern_failures;
+      }
       if (pattern_quiet)
         ++GC_pattern_quiet_closings;
       ++GC_admission_closings;
@@ -1102,7 +1187,9 @@ GC_admission_finish(GC_bool is_full)
       /* A stable live-size total can hide a different allocation pattern.
          Retry after a bounded number of fulls, preserving the tracked-full
          barrier before another minor. */
-      GC_admission_probe_fulls = 1U << GC_admission_failed_probes;
+      GC_admission_probe_fulls = GC_pattern_mode == 4 && !pattern_quiet
+          ? 1U << (GC_pattern_failures + 2)
+          : 1U << GC_admission_failed_probes;
     } else if (
 #ifdef NO_CLOCK
                GC_admission_pending
@@ -2229,7 +2316,9 @@ GC_finish_collection(void)
 #if !defined(GC_DISABLE_INCREMENTAL) && defined(MPROTECT_VDB)
   if (GC_incremental_start_pending
       && (GC_used_heap_size_after_full >= GC_incremental_start_threshold
-          || (GC_pattern_mode == 2 && GC_pattern_total >= 4096))) {
+          || (GC_pattern_mode == 2 && GC_pattern_total >= 4096)
+          || (GC_pattern_mode == 3 && GC_pattern_total >= 64)
+          || (GC_pattern_mode == 4 && GC_pattern_evidence >= 64))) {
     /* All reachable objects were traced by this ordinary full collection.
        Start dirty tracking only after all live objects have been traced;
        the first protection pass covers every pointer-bearing heap range. */
@@ -2238,8 +2327,13 @@ GC_finish_collection(void)
     GC_handle_protected_regions_limit();
     if (GC_incremental) {
       GC_read_dirty(TRUE);
-      if (GC_incremental && GC_pattern_mode != 0)
+      if (GC_incremental && GC_pattern_mode != 0) {
         ++GC_pattern_activations;
+        GC_pattern_activation_gc = GC_gc_no;
+        GC_pattern_activation_hints = GC_pattern_total;
+        GC_pattern_activation_evidence = GC_pattern_evidence;
+        GC_pattern_activation_allocated = GC_bytes_allocd_before_gc;
+      }
       if (GC_incremental)
         GC_COND_LOG_PRINTF("Incremental mprotect activated after full collection #%lu: occupied heap %lu bytes, threshold %lu bytes\n",
                            (unsigned long)GC_gc_no,
