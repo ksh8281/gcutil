@@ -994,10 +994,10 @@ GC_allochblk_from_free_lists(size_t lb_adjusted, int kind, unsigned flags,
   return NULL;
 }
 
-/* No collection, expansion, coalescing or remapping.  On success the
+/* No collection, expansion or coalescing.  On success the
    caller must initialize the allocated object before invoking any GC. */
 GC_INNER struct hblk *
-GC_try_mapped_allochblk(size_t lb_adjusted, int kind, unsigned flags,
+GC_try_free_allochblk(size_t lb_adjusted, int kind, unsigned flags,
                         size_t align_m1)
 {
   size_t blocks = OBJ_SZ_TO_BLOCKS_CHECKED(lb_adjusted);
@@ -1006,9 +1006,12 @@ GC_try_mapped_allochblk(size_t lb_adjusted, int kind, unsigned flags,
   if (UNLIKELY(SIZET_SAT_ADD(blocks * HBLKSIZE, align_m1)
                >= (GC_SIZE_MAX >> 1)))
     return NULL;
-  return GC_allochblk_from_free_lists(lb_adjusted, kind, flags,
-                                       GC_hblk_fl_from_blocks(blocks),
-                                       align_m1, TRUE);
+  /* Prefer resident free space, but decommitted free blocks are reusable
+     too. Collecting before remapping them cannot reclaim that space again. */
+  struct hblk *result = GC_allochblk_from_free_lists(
+      lb_adjusted, kind, flags, GC_hblk_fl_from_blocks(blocks), align_m1, TRUE);
+  return result != NULL ? result : GC_allochblk_from_free_lists(
+      lb_adjusted, kind, flags, GC_hblk_fl_from_blocks(blocks), align_m1, FALSE);
 }
 
 GC_INNER struct hblk *
@@ -1051,7 +1054,9 @@ GC_allochblk(size_t lb_adjusted, int kind,
      * the heap, then retry because the collection may have populated or
      * coalesced the block free lists.
      */
-    GC_gcollect_inner();
+    /* Allocation pressure is automatic. A closed admission interval can
+       keep tracking parked until the normal tracked-full rearm barrier. */
+    (void)GC_try_to_collect_inner(GC_never_stop_func, TRUE);
     return GC_allochblk_from_free_lists(lb_adjusted, kind, flags, start_list,
                                         align_m1, FALSE);
   }

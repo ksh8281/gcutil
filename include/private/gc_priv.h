@@ -3602,7 +3602,7 @@ GC_INNER ptr_t GC_build_fl(struct hblk *h, ptr_t list, size_t lg,
  */
 GC_INNER struct hblk *GC_allochblk(size_t lb_adjusted, int kind,
                                    unsigned flags, size_t align_m1);
-GC_INNER struct hblk *GC_try_mapped_allochblk(size_t lb_adjusted, int kind,
+GC_INNER struct hblk *GC_try_free_allochblk(size_t lb_adjusted, int kind,
                                              unsigned flags, size_t align_m1);
 
 /*
@@ -3668,10 +3668,12 @@ GC_INNER int GC_CALLBACK GC_never_stop_func(void);
  * the allocator lock.  If `stop_func` is not `GC_never_stop_func`, then
  * abort if `stop_func` returns `TRUE`.  Return `TRUE` if we successfully
  * completed the collection (otherwise the collection is aborted).
+ * `automatic` distinguishes allocator pressure from explicit collection.
  */
-GC_INNER GC_bool GC_try_to_collect_inner(GC_stop_func stop_func);
+GC_INNER GC_bool GC_try_to_collect_inner(GC_stop_func stop_func,
+                                           GC_bool automatic);
 
-#define GC_gcollect_inner() (void)GC_try_to_collect_inner(GC_never_stop_func)
+#define GC_gcollect_inner() (void)GC_try_to_collect_inner(GC_never_stop_func, FALSE)
 
 #ifdef THREADS
 /*

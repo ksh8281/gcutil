@@ -1422,7 +1422,7 @@ GC_get_on_collection_event(void)
 }
 
 GC_INNER GC_bool
-GC_try_to_collect_inner(GC_stop_func stop_func)
+GC_try_to_collect_inner(GC_stop_func stop_func, GC_bool automatic)
 {
 #ifndef NO_CLOCK
   CLOCK_TYPE start_time = CLOCK_TYPE_INITIALIZER;
@@ -1493,7 +1493,7 @@ GC_try_to_collect_inner(GC_stop_func stop_func)
   SAVE_CALLERS_TO_LAST_STACK();
   GC_is_full_gc = TRUE;
   EXIT_GC();
-  if (!GC_stopped_mark(stop_func, FALSE)) {
+  if (!GC_stopped_mark(stop_func, automatic)) {
     if (!GC_incremental) {
       /*
        * We are partially done and have no way to complete or use
@@ -2399,8 +2399,8 @@ GC_try_to_collect_general(GC_stop_func stop_func, GC_bool force_unmap)
 #endif
   /* Minimize junk left in my registers. */
   GC_noop6(0, 0, 0, 0, 0, 0);
-  result = GC_try_to_collect_inner(stop_func != 0 ? stop_func
-                                                  : GC_default_stop_func);
+  result = GC_try_to_collect_inner(
+      stop_func != 0 ? stop_func : GC_default_stop_func, FALSE);
 #ifdef USE_MUNMAP
   /* Restore it. */
   GC_unmap_threshold = old_unmap_threshold;
@@ -2858,7 +2858,7 @@ GC_collect_or_expand(word needed_blocks, unsigned flags, GC_bool retry)
     gc_not_stopped = GC_try_to_collect_inner(
         GC_bytes_allocd > 0 && (!GC_dont_expand || !retry)
             ? GC_default_stop_func
-            : GC_never_stop_func);
+            : GC_never_stop_func, TRUE);
     if (gc_not_stopped || !retry) {
       /*
        * Either the collection has not been aborted or this is the

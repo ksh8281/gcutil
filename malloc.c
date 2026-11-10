@@ -99,16 +99,16 @@ GC_alloc_large(size_t lb_adjusted, int kind, unsigned flags, size_t align_m1)
 #endif
         ) {
       /* A completed stopped collection has no incremental mark work to
-         advance for this allocation. Reuse an already mapped free block
-         first; ordinary block-pressure handling still collects before
-         heap growth. This probe cannot remap or expand the heap. */
+         advance for this allocation. Reuse an existing free block first,
+         including decommitted space; ordinary block-pressure handling
+         still collects before heap growth. This probe cannot expand. */
       if (GC_admission_vdb_parked) {
         /* Parked intervals collect only fulls. Match ordinary allocation
            pressure instead of inserting an early incremental GC probe. */
         h = GC_allochblk(lb_adjusted, kind, flags, align_m1);
       } else {
         ++GC_large_defer_attempts;
-        h = GC_try_mapped_allochblk(lb_adjusted, kind, flags, align_m1);
+        h = GC_try_free_allochblk(lb_adjusted, kind, flags, align_m1);
         if (h != NULL) {
           ++GC_large_defer_success;
           GC_large_defer_bytes += lb_adjusted;
