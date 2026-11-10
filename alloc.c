@@ -828,6 +828,9 @@ STATIC MAY_THREAD_LOCAL word GC_pattern_quiet_closings;
 STATIC MAY_THREAD_LOCAL word GC_pattern_sites;
 STATIC MAY_THREAD_LOCAL word GC_pattern_evidence;
 STATIC MAY_THREAD_LOCAL word GC_pattern_evidence_anchor;
+STATIC MAY_THREAD_LOCAL word GC_pattern_closed_sites;
+STATIC MAY_THREAD_LOCAL word GC_pattern_closed_gc;
+STATIC MAY_THREAD_LOCAL word GC_pattern_fresh_evidence;
 STATIC MAY_THREAD_LOCAL word GC_pattern_hot_site;
 STATIC MAY_THREAD_LOCAL word GC_pattern_rejected_site;
 STATIC MAY_THREAD_LOCAL unsigned GC_pattern_failures;
@@ -848,6 +851,8 @@ GC_pattern_reset_sites(void)
 {
   GC_pattern_sites = GC_pattern_evidence = GC_pattern_evidence_anchor = 0;
   GC_pattern_hot_site = GC_pattern_rejected_site = 0;
+  GC_pattern_closed_sites = GC_pattern_closed_gc = 0;
+  GC_pattern_fresh_evidence = 0;
   GC_pattern_failures = 0;
   GC_pattern_activation_gc = GC_pattern_activation_hints = 0;
   GC_pattern_activation_evidence = GC_pattern_activation_allocated = 0;
@@ -877,6 +882,9 @@ GC_note_allocation_pattern_site(unsigned kind, GC_word site)
     GC_pattern_site_counters[slot].hits = 0;
     GC_pattern_evidence += 64;
     GC_pattern_hot_site = site;
+    if (GC_admission_closed && site > GC_pattern_closed_sites
+        && GC_pattern_fresh_evidence < 256)
+      GC_pattern_fresh_evidence += 64;
   }
 }
 
@@ -1144,7 +1152,14 @@ GC_admission_finish(GC_bool is_full)
         word required = GC_pattern_rejected_site == 0 ? 64
             : GC_pattern_hot_site != GC_pattern_rejected_site ? 256
             : (word)4096 << GC_pattern_failures;
-        retry = GC_admission_probe_fulls == 0 && evidence >= required;
+        /* A newly compiled allocation phase can qualify independently of
+           the previous phase's retry debt. Existing rejected code cannot
+           spend its accumulated hints here. Rearm only at a full boundary;
+           a parked epoch still needs the ordinary tracked-full barrier. */
+        GC_bool fresh_phase = GC_pattern_fresh_evidence >= 256
+                              && GC_gc_no - GC_pattern_closed_gc >= 2;
+        retry = fresh_phase
+                || (GC_admission_probe_fulls == 0 && evidence >= required);
       } else if (GC_pattern_mode >= 2) {
         retry = GC_admission_probe_fulls == 0
                 && GC_pattern_total - GC_pattern_close_anchor >= 4096;
@@ -1172,6 +1187,9 @@ GC_admission_finish(GC_bool is_full)
       GC_pattern_close_anchor = GC_pattern_total;
       if (GC_pattern_mode == 4) {
         GC_pattern_evidence_anchor = GC_pattern_evidence;
+        GC_pattern_closed_sites = GC_pattern_sites;
+        GC_pattern_closed_gc = GC_gc_no;
+        GC_pattern_fresh_evidence = 0;
         GC_pattern_rejected_site = pattern_quiet ? 0 : GC_pattern_hot_site;
         if (!pattern_quiet && GC_pattern_failures < 6)
           ++GC_pattern_failures;
