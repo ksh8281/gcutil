@@ -1380,6 +1380,11 @@ GC_maybe_gc(void)
   GC_young_mark_active = FALSE;
   if (GC_young_mark_aborted) {
     ++GC_young_mark_aborts;
+    /* The fallback full restarts the cost timer. Account for this failed
+       trial first: it consumed marking time without buying allocation
+       progress. Otherwise admission repeatedly retries an unpriced minor.
+       Do not finish or reclaim any of its partial marks. */
+    GC_admission_cost_finish(FALSE);
     GC_admission_sample = GC_admission_pending = FALSE;
     /* An abandoned partial queue says nothing about the capacity needed
        by a fresh full trace.  Full overflow can request growth again. */
