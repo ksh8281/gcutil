@@ -4793,6 +4793,24 @@ GC_unprotect_all_heap(void)
 }
 #  endif
 
+/* Called only after a completed full collection.  Pending activation keeps
+   newly added sections in the isolate registry while ordinary full GC runs.
+   Resumption must trace a full and protect every live range before minors. */
+GC_INNER void
+GC_pause_pattern_tracking(void)
+{
+#  if defined(GC_COARSE_MPROTECT) && !defined(PREFER_MMAP_PROT_NONE) \
+      && !defined(FORCE_MPROTECT_BEFORE_MADVISE)
+  if (GC_auto_incremental && !IS_NON_MPROTECT_VDB()) {
+    GC_unprotect_all_heap();
+    GC_coarse_heap_writable = TRUE;
+    GC_incremental_start_pending = TRUE;
+    GC_incremental = FALSE;
+    ++GC_admission_full_rw_epochs;
+  }
+#  endif
+}
+
 #  if (defined(THREADS) && !defined(NEED_FIXUP_POINTER) \
        && !defined(NO_ALL_INTERIOR_POINTERS))           \
       || (defined(DONT_PROTECT_PTRFREE) && !defined(UFFDWP_VDB))

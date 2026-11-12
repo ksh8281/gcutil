@@ -1043,6 +1043,14 @@ GC_admission_cost_finish(GC_bool is_full)
 #endif
 }
 
+/* Distinguish a resumable policy pause from permanent VDB fallback. */
+GC_INNER int
+GC_admission_tracking_is_paused(void)
+{
+  return GC_admission_vdb_parked && GC_incremental_start_pending
+         && !GC_incremental;
+}
+
 /* Read-only TLS policy query: also called from the write-fault handler.
    A full can still be the next collection; this means minor scheduling is
    enabled for this interval rather than parked/rejected by admission. */
@@ -1108,7 +1116,8 @@ GC_admission_finish(GC_bool is_full)
 
   if (!GC_generational || !GC_young_admission)
     return;
-  if (is_full && GC_admission_vdb_parked && !GC_admission_skip_protect) {
+  if (is_full && GC_incremental && GC_admission_vdb_parked
+      && !GC_admission_skip_protect) {
     GC_admission_vdb_parked = FALSE;
     ++GC_admission_restore_fulls;
   }
@@ -1763,7 +1772,8 @@ GC_stopped_mark(GC_stop_func stop_func, GC_bool automatic)
         && !GC_admission_ignore_full && !GC_find_leak_inner
         && !GC_is_enumerate_reachable_objects
         && GC_get_actual_vdb() == GC_VDB_MPROTECT;
-  if (GC_admission_skip_protect)
+  if (GC_admission_skip_protect
+      || (automatic && GC_is_full_gc && GC_admission_tracking_is_paused()))
     ++GC_admission_untracked_fulls;
   ENTER_GC();
 #if !defined(REDIRECT_MALLOC) && defined(USE_WINALLOC)
@@ -2305,6 +2315,13 @@ GC_finish_collection(void)
   GC_admission_cost_finish(GC_is_full_gc);
   GC_admission_finish(GC_is_full_gc);
   GC_admission_skip_protect = FALSE;
+#if !defined(GC_DISABLE_INCREMENTAL) && defined(MPROTECT_VDB)
+  if (GC_is_full_gc && GC_pattern_mode == 4 && GC_young_full_rw_park
+      && GC_admission_closed && GC_admission_vdb_parked
+      && !GC_admission_ignore_full && !GC_find_leak_inner
+      && !GC_is_enumerate_reachable_objects)
+    GC_pause_pattern_tracking();
+#endif
   if (GC_is_full_gc) {
     GC_bench_anchor_full_live = 2 * GC_composite_in_use + GC_atomic_in_use / 4;
     GC_bench_anchor_gc_no = GC_gc_no;
@@ -2332,7 +2349,7 @@ GC_finish_collection(void)
   GC_finalizer_bytes_freed = 0;
 
 #if !defined(GC_DISABLE_INCREMENTAL) && defined(MPROTECT_VDB)
-  if (GC_incremental_start_pending
+  if (GC_incremental_start_pending && !GC_admission_closed
       && (GC_used_heap_size_after_full >= GC_incremental_start_threshold
           || (GC_pattern_mode == 2 && GC_pattern_total >= 4096)
           || (GC_pattern_mode == 3 && GC_pattern_total >= 64)
@@ -2340,12 +2357,17 @@ GC_finish_collection(void)
     /* All reachable objects were traced by this ordinary full collection.
        Start dirty tracking only after all live objects have been traced;
        the first protection pass covers every pointer-bearing heap range. */
+    GC_bool resuming = GC_admission_vdb_parked;
     GC_incremental_start_pending = FALSE;
     GC_incremental = TRUE;
     GC_handle_protected_regions_limit();
     if (GC_incremental) {
       GC_read_dirty(TRUE);
-      if (GC_incremental && GC_pattern_mode != 0) {
+      if (GC_incremental && resuming) {
+        GC_admission_vdb_parked = FALSE;
+        ++GC_admission_restore_fulls;
+      }
+      if (GC_incremental && GC_pattern_mode != 0 && !resuming) {
         ++GC_pattern_activations;
         GC_pattern_activation_gc = GC_gc_no;
         GC_pattern_activation_hints = GC_pattern_total;

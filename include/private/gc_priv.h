@@ -2072,8 +2072,8 @@ struct _GC_arrays {
   GC_bool _incremental;
 
   /* Preserve VDB initialization and section registration while collecting
-     small heaps without page protection.  Activation is one-way and only
-     follows a completed full mark. */
+     without page protection, before initial activation or during a policy
+     pause.  Activation and resumption follow a completed full mark. */
 #  define GC_incremental_start_pending GC_arrays._incremental_start_pending
   GC_bool _incremental_start_pending;
 
@@ -3052,6 +3052,10 @@ GC_EXTERN MAY_THREAD_LOCAL GC_bool GC_admission_skip_protect;
 GC_INNER void GC_admission_deinit(void);
 GC_INNER GC_bool GC_minor_grace_is_applicable(void);
 GC_INNER void GC_admission_forget_repair(void);
+GC_INNER int GC_admission_tracking_is_paused(void);
+#if !defined(GC_DISABLE_INCREMENTAL) && defined(MPROTECT_VDB)
+GC_INNER void GC_pause_pattern_tracking(void);
+#endif
 GC_EXTERN MAY_THREAD_LOCAL word GC_admission_poor_samples;
 GC_EXTERN MAY_THREAD_LOCAL word GC_admission_closings;
 GC_EXTERN MAY_THREAD_LOCAL word GC_admission_rearms;
